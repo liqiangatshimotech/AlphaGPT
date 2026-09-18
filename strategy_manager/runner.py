@@ -8,6 +8,7 @@ from loguru import logger
 from data_pipeline.data_manager import DataManager
 from model_core.vm import StackVM
 from model_core.data_loader import CryptoDataLoader
+from model_core.vocab import load_formula
 from execution.trader import SolanaTrader
 from execution.utils import get_mint_decimals
 from .config import StrategyConfig
@@ -25,13 +26,15 @@ class StrategyRunner:
         self.loader = CryptoDataLoader()
         self.token_map = {} # {address: tensor_index} 用于快速查找特征
         self.last_scan_time = 0
+        self.entries_paused = False
         self.stop_signal_path = os.getenv("STOP_SIGNAL_PATH", "STOP_SIGNAL")
         
         try:
             with open("best_meme_strategy.json", "r") as f:
-                # 兼容早期版本
                 data = json.load(f)
-                self.formula = data if isinstance(data, list) else data.get("formula")
+                self.formula = load_formula(data)
+                if isinstance(data, list) or "vocab_version" not in data:
+                    logger.warning("Unversioned formula loaded with original VM token semantics.")
             logger.success(f"Loaded Strategy: {self.formula}")
         except FileNotFoundError:
             logger.critical("Strategy file not found! Please train model first.")
@@ -47,32 +50,35 @@ class StrategyRunner:
         
         while True:
             try:
-                if self._handle_stop_signal():
-                    break
+                stop_requested = self._handle_stop_signal()
 
                 loop_start = time.time()
                 
-                if time.time() - self.last_scan_time > 900: # 15 min
+                if not stop_requested and time.time() - self.last_scan_time > 900: # 15 min
                     logger.info("o.O | Syncing Data Pipeline...")
                     await self.data_mgr.pipeline_sync_daily()
                     self.last_scan_time = time.time()
 
-                self.loader.load_data(limit_tokens=300)
-                await self._build_token_mapping()
-
-                if self._handle_stop_signal():
-                    break
+                # A database outage must not disable price-based exits.
+                try:
+                    self.loader.load_data(limit_tokens=300)
+                    await self._build_token_mapping()
+                except Exception:
+                    self.token_map = {}
+                    logger.exception("Data refresh failed; monitoring positions without AI signals.")
+                    await self.monitor_positions()
+                    await asyncio.sleep(30)
+                    continue
 
                 await self.monitor_positions()
 
                 if self._handle_stop_signal():
-                    break
-                
-                if self.portfolio.get_open_count() < StrategyConfig.MAX_OPEN_POSITIONS:
+                    logger.warning("New entries paused; position monitoring remains active.")
+                elif self.portfolio.get_open_count() < StrategyConfig.MAX_OPEN_POSITIONS:
                     await self.scan_for_entries()
                 else:
-                    logger.info("=-= | Max positions reached. Scanning skipped.")
-                
+                    logger.info("Max positions reached. Scanning skipped.")
+
                 elapsed = time.time() - loop_start
                 sleep_time = max(10, 60 - elapsed)
                 logger.info(f"Cycle finished in {elapsed:.2f}s. Sleeping {sleep_time:.2f}s...")
@@ -83,25 +89,24 @@ class StrategyRunner:
                 await asyncio.sleep(30)
 
     def _stop_requested(self):
-        if not os.path.exists(self.stop_signal_path):
-            return False
         try:
             with open(self.stop_signal_path, "r") as f:
                 signal = f.read().strip().upper()
-        except OSError:
+        except FileNotFoundError:
+            return False
+        except (OSError, UnicodeError):
             return True
         return signal in {"", "STOP", "STOPPED"}
 
     def _handle_stop_signal(self):
-        if not self._stop_requested():
-            return False
-        logger.warning(f"STOP signal received from {self.stop_signal_path}. Trading loop will stop.")
-        try:
-            with open(self.stop_signal_path, "w") as f:
-                f.write("STOPPED")
-        except OSError as e:
-            logger.warning(f"Failed to mark stop signal as consumed: {e}")
-        return True
+        paused = self._stop_requested()
+        if paused != self.entries_paused:
+            logger.warning(
+                "New entries paused; existing positions remain monitored."
+                if paused else "Stop signal cleared; new entries enabled."
+            )
+            self.entries_paused = paused
+        return paused
 
     async def _build_token_mapping(self):
         self.token_map = {addr: idx for idx, addr in enumerate(self.loader.addresses)}
@@ -129,9 +134,10 @@ class StrategyRunner:
 
             if not pos.is_moonbag and pnl_pct >= StrategyConfig.TAKE_PROFIT_Target1:
                 logger.success(f"😄 | MOONBAG TP: {pos.symbol} PnL: {pnl_pct:.2%}")
-                await self._execute_sell(token_addr, StrategyConfig.TP_Target1_Ratio, "Moonbag")
-                pos.is_moonbag = True
-                self.portfolio.save_state()
+                sold = await self._execute_sell(token_addr, StrategyConfig.TP_Target1_Ratio, "Moonbag")
+                if sold and token_addr in self.portfolio.positions:
+                    pos.is_moonbag = True
+                    self.portfolio.save_state()
                 continue
 
             max_gain = (pos.highest_price - pos.entry_price) / pos.entry_price
@@ -219,7 +225,13 @@ class StrategyRunner:
             logger.error("Failed to get quote for buy.")
             return
 
-        tx_signature = await self.trader.buy(token_addr, amount_sol)
+        if self._handle_stop_signal():
+            logger.warning("Buy cancelled because STOP signal became active.")
+            return
+
+        tx_signature = await self.trader.buy(
+            token_addr, amount_sol, should_cancel=self._handle_stop_signal
+        )
         
         if tx_signature: # Assuming buy returns Sig or True
             # 更新 Portfolio
@@ -242,10 +254,6 @@ class StrategyRunner:
             logger.success(f"+ | Position Added: {token_amount_ui:.2f} units @ {entry_price_sol:.6f} SOL")
 
     async def _execute_sell(self, token_addr, ratio, reason):
-        if self._handle_stop_signal():
-            logger.warning("Sell skipped because STOP signal is active.")
-            return
-
         pos = self.portfolio.positions.get(token_addr)
         if not pos: return
 
@@ -262,6 +270,7 @@ class StrategyRunner:
                 self.portfolio.update_holding(token_addr, new_amount)
                 
             logger.success(f"o.O | Trade Completed: {reason}")
+        return bool(success)
 
     async def _run_inference(self, token_addr):
         idx = self.token_map.get(token_addr)

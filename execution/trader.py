@@ -15,7 +15,9 @@ class SolanaTrader:
         self.is_running = True
         self.TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
-    async def buy(self, token_address: str, amount_sol: float, slippage_bps=500):
+    async def buy(self, token_address: str, amount_sol: float, slippage_bps=500, *, should_cancel=None):
+        if should_cancel is not None and should_cancel():
+            return False
         logger.info(f"Executing BUY: {amount_sol} SOL -> {token_address}")
         balance = await self.rpc.get_balance()
         if balance < amount_sol + 0.02:
@@ -35,6 +37,9 @@ class SolanaTrader:
         logger.info(f"Quote received. Est. Output: {out_amount} raw units.")
         b64_tx = await self.jup.get_swap_tx(quote)
         if not b64_tx:
+            return False
+        if should_cancel is not None and should_cancel():
+            logger.warning("Buy cancelled before signing/submission.")
             return False
         try:
             txn = self.jup.deserialize_and_sign(b64_tx)

@@ -14,7 +14,7 @@ class StackVM:
             for token in formula_tokens:
                 token = int(token)
                 if token < self.feat_offset:
-                    if token >= feat_tensor.shape[1]:
+                    if token < 0 or token >= feat_tensor.shape[1]:
                         return None
                     stack.append(feat_tensor[:, token, :])
                 elif token in self.op_map:

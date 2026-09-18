@@ -7,17 +7,14 @@ from .config import Config
 
 class BirdeyeFetcher:
     def __init__(self):
-        self.headers = {
-            "X-API-KEY": Config.BIRDEYE_API_KEY,
-            "accept": "application/json"
-        }
+        self.headers = Config.birdeye_headers()
         self.semaphore = asyncio.Semaphore(5)
 
     async def get_trending_tokens(self, limit=100):
         url = f"{Config.BIRDEYE_BASE_URL}/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit={limit}"
         async with aiohttp.ClientSession(headers=self.headers) as session:
             try:
-                async with session.get(url) as resp:
+                async with session.get(url, allow_redirects=False) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         tokens = data.get('data', {}).get('tokens', [])
@@ -44,7 +41,7 @@ class BirdeyeFetcher:
 
         async with self.semaphore:
             try:
-                async with session.get(url, params=params) as resp:
+                async with session.get(url, params=params, allow_redirects=False) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         items = data.get('data', {}).get('items', [])

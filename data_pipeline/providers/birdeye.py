@@ -8,10 +8,7 @@ from .base import DataProvider
 class BirdeyeProvider(DataProvider):
     def __init__(self):
         self.base_url = Config.BIRDEYE_BASE_URL
-        self.headers = {
-            "X-API-KEY": Config.BIRDEYE_API_KEY,
-            "accept": "application/json"
-        }
+        self.headers = Config.birdeye_headers()
         self.semaphore = asyncio.Semaphore(Config.CONCURRENCY)
 
     @staticmethod
@@ -34,7 +31,7 @@ class BirdeyeProvider(DataProvider):
         
         async with aiohttp.ClientSession(headers=self.headers) as session:
             try:
-                async with session.get(url, params=params) as resp:
+                async with session.get(url, params=params, allow_redirects=False) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         raw_list = data.get('data', {}).get('tokens', [])
@@ -73,7 +70,7 @@ class BirdeyeProvider(DataProvider):
 
         async with self.semaphore:
             try:
-                async with session.get(url, params=params) as resp:
+                async with session.get(url, params=params, allow_redirects=False) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         items = data.get('data', {}).get('items', [])

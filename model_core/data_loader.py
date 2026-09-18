@@ -15,8 +15,12 @@ class CryptoDataLoader:
     def load_data(self, limit_tokens=500):
         print("Loading data from SQL...")
         top_query = f"""
-        SELECT address FROM tokens 
-        LIMIT {limit_tokens} 
+        SELECT t.address
+        FROM tokens AS t
+        JOIN ohlcv AS o ON o.address = t.address
+        GROUP BY t.address
+        ORDER BY COUNT(*) DESC, t.address ASC
+        LIMIT {limit_tokens}
         """
         self.addresses = pd.read_sql(top_query, self.engine)['address'].tolist()
         if not self.addresses: raise ValueError("No tokens found.")

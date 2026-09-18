@@ -8,6 +8,7 @@ from .data_loader import CryptoDataLoader
 from .alphagpt import AlphaGPT, NewtonSchulzLowRankDecay, StableRankMonitor
 from .vm import StackVM
 from .backtest import MemeBacktest
+from .vocab import FORMULA_VOCAB, FORMULA_VOCAB_VERSION, load_formula
 
 class AlphaEngine:
     def __init__(self, use_lord_regularization=True, lord_decay_rate=1e-3, lord_num_iterations=5):
@@ -138,9 +139,15 @@ class AlphaEngine:
             
             pbar.set_postfix(postfix_dict)
 
+        # Validate before opening the file so a failed run preserves the previous strategy.
+        load_formula(self.best_formula)
         # Save best formula
         with open("best_meme_strategy.json", "w") as f:
-            json.dump(self.best_formula, f)
+            json.dump({
+                "formula": self.best_formula,
+                "vocab_version": FORMULA_VOCAB_VERSION,
+                "token_names": list(FORMULA_VOCAB.token_names),
+            }, f)
         
         # Save training history
         import json as js

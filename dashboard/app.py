@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import time
+import os
 from data_service import DashboardService
 from visualizer import plot_pnl_distribution, plot_market_scatter
 
@@ -42,10 +43,10 @@ with st.sidebar:
     if st.button("Refresh Data"):
         st.rerun()
         
-    if st.button("EMERGENCY STOP", type="primary"):
-        with open("STOP_SIGNAL", "w") as f:
+    if st.button("PAUSE NEW ENTRIES", type="primary"):
+        with open(os.getenv("STOP_SIGNAL_PATH", "STOP_SIGNAL"), "w") as f:
             f.write("STOP")
-        st.error("STOP SIGNAL SENT, Process will terminate on next cycle.")
+        st.error("New entries paused. Existing positions remain monitored for exits. Remove the stop file to resume entries.")
 
 col1, col2, col3, col4 = st.columns(4)
 portfolio_df = svc.load_portfolio()
