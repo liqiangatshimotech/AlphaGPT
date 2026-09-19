@@ -141,6 +141,9 @@ def simulate(
         px = float(open_[token, bar])
         size = qty * px
         impact = size / liquidity
+        if not math.isfinite(impact):
+            missing(bar, token, 'unpriceable_exit_impact')
+            return False
         if liquidity < min_liquidity or impact > max_impact:
             risk_events.append({'bar': int(bar), 'token': int(token),
                                 'reason': 'exit_liquidity_limit', 'impact': float(impact),
@@ -186,6 +189,9 @@ def simulate(
             missing(bar, i, 'missing_final_liquidity')
             return False
         px = float(close[i, bar]); size = qty * px; impact = size / liquidity
+        if not math.isfinite(impact):
+            missing(bar, i, 'unpriceable_final_impact')
+            return False
         rate = fee + impact
         if rate >= 1:
             missing(bar, i, 'final_impact_unpriceable')
@@ -285,9 +291,19 @@ def simulate(
                         else:
                             # Solve spend*(1+fee)+spend**2/liquidity <= cash,
                             # avoiding an implicit excess debit as cash shrinks.
-                            affordable = 2 * cash / ((1 + fee) + math.sqrt((1 + fee) ** 2 + 4 * cash / liquidity))
+                            try:
+                                discriminant = (1 + fee) ** 2 + 4 * cash / liquidity
+                                if not math.isfinite(discriminant):
+                                    raise OverflowError
+                                affordable = 2 * cash / ((1 + fee) + math.sqrt(discriminant))
+                            except (OverflowError, ZeroDivisionError):
+                                missing(fill, i, 'unpriceable_entry_impact')
+                                break
                             spend = min(notional, affordable)
                             impact = spend / liquidity
+                            if not math.isfinite(impact):
+                                missing(fill, i, 'unpriceable_entry_impact')
+                                break
                             if liquidity < min_liquidity or impact > max_impact:
                                 rejections.append({'bar': int(fill), 'token': i,
                                                    'reason': 'entry_liquidity_limit',
