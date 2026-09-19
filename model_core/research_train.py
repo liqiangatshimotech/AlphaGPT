@@ -58,12 +58,22 @@ def causal_features(raw):
     return torch.stack(out,1)
 
 
-def metrics(factor,raw,target,a,b):
+def metrics(factor,raw,target,a,b,threshold=1.734601,top_k=0):
     # Targets use t+1 and t+2: purge the final two decision rows of each segment.
     b-=2
     liq=raw['liquidity'][:,a:b]
     valid=raw['tradable'][:,a:b]
-    pos=((factor[:,a:b]>1.734601)&(liq>500000)&valid).float()
+    eligible=(liq>500000)&valid
+    scores=factor[:,a:b]
+    if top_k:
+        k=min(top_k,scores.shape[0])
+        rank_scores=scores.masked_fill(~eligible,-torch.inf)
+        winners=torch.topk(rank_scores,k,dim=0).indices
+        pos=torch.zeros_like(scores)
+        pos.scatter_(0,winners,torch.gather((scores>threshold).float(),0,winners))
+        pos*=eligible.float()
+    else:
+        pos=((scores>threshold)&eligible).float()
     prev=torch.cat([torch.zeros_like(pos[:,:1]),pos[:,:-1]],1)
     changes=(pos-prev).abs()
     rate=.006+(1000/(liq+1e-9)).clamp(0,.05)
@@ -74,7 +84,13 @@ def metrics(factor,raw,target,a,b):
     peak=torch.cat([curve.new_zeros(1),curve]).cummax(0).values[1:]
     dd=float((peak-curve).max())
     net=float(curve[-1]); entries=int(((pos>0)&(prev==0)).sum())
-    hold=((liq>500000)&valid).float()
+    if top_k:
+        hold_scores=liq.masked_fill(~eligible,-torch.inf)
+        winners=torch.topk(hold_scores,min(top_k,hold_scores.shape[0]),dim=0).indices
+        hold=torch.zeros_like(hold_scores)
+        hold.scatter_(0,winners,torch.gather(eligible.float(),0,winners))
+    else:
+        hold=eligible.float()
     hold_prev=torch.cat([torch.zeros_like(hold[:,:1]),hold[:,:-1]],1)
     hold_changes=(hold-hold_prev).abs()
     hold_pnl=hold*target[:,a:b]-hold_changes*rate
@@ -83,11 +99,20 @@ def metrics(factor,raw,target,a,b):
     excess=net-hold_net
     # Penalize churn separately so a high turnover formula cannot win by
     # exploiting small noisy returns after costs.
-    reward=excess-dd-0.00005*float(changes.sum()) if entries>=5 else -1.0
+    per_token=pnl.sum(1)
+    median_excess=float((per_token-hold_pnl.sum(1)).median())
+    active_tokens=int((pos.sum(1)>0).sum())
+    positive_fraction=float((per_token>0).float().mean())
+    concentration_penalty=max(0.0, 5-active_tokens)*0.05
+    coverage_gate=max(5, int(0.20 * pos.shape[0] + 0.999))
+    reward=0.5*excess+0.5*median_excess-dd-0.00005*float(changes.sum())-concentration_penalty if entries>=5 and active_tokens>=coverage_gate else -1.0
     return dict(net_pnl_per_initial_notional=net,hold_net_pnl=hold_net,
                 excess_vs_hold=excess,drawdown_additive=dd,
+                median_excess_vs_hold=median_excess,
                 turnover_units=float(changes.sum()+pos[:,-1].sum()),entries=entries,
                 exposure=float(pos.mean()),cost_per_initial_notional=float((changes*rate).sum()/pos.shape[0]+(pos[:,-1]*rate[:,-1]).mean()),
+                active_tokens=active_tokens,median_token_pnl=float(per_token.median()),
+                positive_token_fraction=positive_fraction,top_k=top_k,
                 reward=reward)
 
 
