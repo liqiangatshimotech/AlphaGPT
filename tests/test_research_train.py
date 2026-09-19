@@ -18,6 +18,15 @@ class ResearchTests(unittest.TestCase):
         raw={k:torch.rand(2,100)+1 for k in ['close','open','high','low','volume','liquidity','fdv']}; raw['high']=raw['low']+1; raw['observed']=torch.ones(2,100,dtype=torch.bool)
         full=causal_features(raw); prefix=causal_features({k:v[:,:60] for k,v in raw.items()})
         torch.testing.assert_close(full[:,:,:60],prefix)
+
+    def test_listing_warmup_is_zero(self):
+        n=40; raw={k:torch.ones(1,n) for k in ['close','open','high','low','volume','liquidity','fdv']}
+        raw['high'] += 1; raw['observed']=torch.zeros(1,n,dtype=torch.bool); raw['observed'][:,10:]=True
+        raw['close'][:,30:]=2; raw['open'][:,30:]=2
+        x=causal_features(raw)
+        self.assertEqual(float(x[:,:,:10].abs().sum()),0.0)
+        self.assertEqual(float(x[:,:,10:12].abs().sum()),0.0)
+        self.assertGreater(float(x[:,:,30:].abs().sum()),0.0)
     def test_costs_and_purge(self):
         raw={'liquidity':torch.full((1,10),1e6),'tradable':torch.ones(1,10,dtype=torch.bool)}
         t=torch.zeros(1,10); t[:,-2:]=100

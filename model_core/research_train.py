@@ -21,13 +21,26 @@ def legal_mask(depth, remaining):
 
 def causal_features(raw):
     c, v = raw['close'], raw['volume']
+    observed = raw['observed']
+    prev_obs = torch.cat([torch.zeros_like(observed[:, :1]), observed[:, :-1]], 1)
+    prev2_obs = torch.cat([torch.zeros_like(observed[:, :2]), observed[:, :-2]], 1)
+    contiguous1 = observed & prev_obs
+    contiguous2 = contiguous1 & prev2_obs
     prev = torch.cat([c[:, :1], c[:, :-1]], 1)
-    ret = torch.log(c.clamp_min(1e-12)/prev.clamp_min(1e-12))
-    ret = torch.where(raw['observed'] & torch.cat([torch.zeros_like(raw['observed'][:, :1]),raw['observed'][:, :-1]],1),ret,0)
+    ret = torch.where(contiguous1, torch.log(c.clamp_min(1e-12)/prev.clamp_min(1e-12)), torch.zeros_like(c))
     vp = torch.cat([v[:, :1],v[:, :-1]],1)
-    growth = ((v-vp)/(vp+1)).clamp(-5,5)
-    fomo = growth-torch.cat([growth[:, :1],growth[:, :-1]],1)
-    ma = torch.cat([c[:, :1].expand(-1,19),c],1).unfold(1,20,1).mean(-1)
+    growth = torch.where(contiguous1, ((v-vp)/(vp+1)).clamp(-5,5), torch.zeros_like(v))
+    growth_prev = torch.cat([growth[:, :1], growth[:, :-1]], 1)
+    fomo = torch.where(contiguous2, growth-growth_prev, torch.zeros_like(growth))
+    # Rolling statistics use only the current contiguous run.  A late-listed
+    # token therefore has no DEV signal until it has 20 real observations.
+    run = torch.zeros_like(observed, dtype=torch.long)
+    for t in range(observed.shape[1]):
+        run[:, t] = observed[:, t] * (run[:, t-1] + 1 if t else 1)
+    cs = torch.cat([torch.zeros_like(c[:, :1]), c.cumsum(1)], 1)
+    sum20 = cs[:, 20:] - cs[:, :-20]
+    ma = torch.cat([torch.zeros_like(c[:, :19]), sum20 / 20.0], 1)
+    ma = torch.where(run >= 20, ma, torch.zeros_like(ma))
     channels = [ret, (raw['liquidity']/(raw['fdv']+1e-6)*4).clamp(0,1),
                 torch.tanh((c-raw['open'])/(raw['high']-raw['low']+1e-9)*3),
                 fomo, (c-ma)/(ma+1e-9), torch.log1p(v)]
@@ -39,7 +52,9 @@ def causal_features(raw):
             mean=x.cumsum(1)/count
             var=(x.square().cumsum(1)/count-mean.square()).clamp_min(0)
             x=((x-mean)/(var.sqrt()+1e-6)).clamp(-5,5)
-        out.append(torch.where(valid,x,0))
+        # Keep a conservative warm-up mask for every feature.  This prevents
+        # one-bar listing artifacts from becoming tradable formulas.
+        out.append(torch.where(valid & (run >= 20),x,0))
     return torch.stack(out,1)
 
 
@@ -59,10 +74,21 @@ def metrics(factor,raw,target,a,b):
     peak=torch.cat([curve.new_zeros(1),curve]).cummax(0).values[1:]
     dd=float((peak-curve).max())
     net=float(curve[-1]); entries=int(((pos>0)&(prev==0)).sum())
-    return dict(net_pnl_per_initial_notional=net,drawdown_additive=dd,
+    hold=((liq>500000)&valid).float()
+    hold_prev=torch.cat([torch.zeros_like(hold[:,:1]),hold[:,:-1]],1)
+    hold_changes=(hold-hold_prev).abs()
+    hold_pnl=hold*target[:,a:b]-hold_changes*rate
+    hold_pnl[:,-1]-=hold[:,-1]*rate[:,-1]
+    hold_net=float(hold_pnl.mean(0).sum())
+    excess=net-hold_net
+    # Penalize churn separately so a high turnover formula cannot win by
+    # exploiting small noisy returns after costs.
+    reward=excess-dd-0.00005*float(changes.sum()) if entries>=5 else -1.0
+    return dict(net_pnl_per_initial_notional=net,hold_net_pnl=hold_net,
+                excess_vs_hold=excess,drawdown_additive=dd,
                 turnover_units=float(changes.sum()+pos[:,-1].sum()),entries=entries,
                 exposure=float(pos.mean()),cost_per_initial_notional=float((changes*rate).sum()/pos.shape[0]+(pos[:,-1]*rate[:,-1]).mean()),
-                reward=net-dd if entries>=5 else -1.0)
+                reward=reward)
 
 
 def main():
