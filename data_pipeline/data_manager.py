@@ -1,4 +1,5 @@
-import asyncio
+import time
+from datetime import datetime
 import aiohttp
 from loguru import logger
 from .config import Config
@@ -19,9 +20,9 @@ class DataManager:
     async def close(self):
         await self.db.close()
 
-    async def pipeline_sync_daily(self):
+    async def pipeline_sync_daily(self, include_existing=False):
         logger.info("Step 1: Discovering trending tokens...")
-        limit = 500 if Config.BIRDEYE_IS_PAID else 100
+        limit = Config.BIRDEYE_TRENDING_LIMIT
         candidates = await self.birdeye.get_trending_tokens(limit=limit)
         
         logger.info(f"Raw candidates found: {len(candidates)}")
@@ -38,6 +39,10 @@ class DataManager:
             selected_tokens.append(t)
             
         logger.info(f"Tokens selected after filtering: {len(selected_tokens)}")
+        latest = await self.db.get_latest_candles()
+        if include_existing:
+            selected_addresses = {t['address'] for t in selected_tokens}
+            selected_tokens.extend(t for addr, t in latest.items() if addr not in selected_addresses)
         
         if not selected_tokens:
             logger.warning("No tokens passed the filter. Relax constraints in Config.")
@@ -46,30 +51,47 @@ class DataManager:
         db_tokens = [(t['address'], t['symbol'], t['name'], t['decimals'], Config.CHAIN) for t in selected_tokens]
         await self.db.upsert_tokens(db_tokens)
 
-        logger.info(f"Step 4: Fetching OHLCV for {len(selected_tokens)} tokens...")
+        logger.info(f"Incremental OHLCV sync for {len(selected_tokens)} tokens...")
         
+        end_time = int(time.time()) // 60 * 60
+        total_candles = 0
         async with aiohttp.ClientSession(headers=self.birdeye.headers) as session:
-            tasks = []
-            for t in selected_tokens:
-                tasks.append(self.birdeye.get_token_history(
-                    session,
-                    t['address'],
-                    liquidity=t.get('liquidity'),
-                    fdv=t.get('fdv'),
-                ))
-            
-            batch_size = 20
-            total_candles = 0
-            
-            for i in range(0, len(tasks), batch_size):
-                batch = tasks[i:i+batch_size]
-                results = await asyncio.gather(*batch)
-                
-                records = [item for sublist in results if sublist for item in sublist]
-                
-                # 批量写入
-                await self.db.batch_insert_ohlcv(records)
-                total_candles += len(records)
-                logger.info(f"Processed batch {i}/{len(tasks)}. Inserted {len(records)} candles.")
-                
-        logger.success(f"Pipeline complete. Total candles stored: {total_candles}")
+            for i, token in enumerate(selected_tokens, 1):
+                last_time = latest.get(token['address'], {}).get('latest_time')
+                # DB timestamps follow the provider's local-naive convention.
+                # Recheck one boundary candle; insertion is conflict-safe.
+                start_time = int(last_time.timestamp()) if last_time else None
+                records = await self.birdeye.get_token_history(
+                    session, token['address'], liquidity=token.get('liquidity'),
+                    fdv=token.get('fdv'), end_time=end_time, start_time=start_time,
+                )
+                inserted = await self.db.batch_insert_ohlcv(records)
+                total_candles += inserted
+                logger.info(f"History {i}/{len(selected_tokens)}: {len(records)} candles fetched, {inserted} new rows")
+            # Store current pool observations separately.  These values are
+            # valid at snapshot time only; they are intentionally not copied
+            # onto the historical OHLCV rows.
+            try:
+                # Use a separate session: Birdeye's API key header must never
+                # be sent to the independent Dexscreener host.
+                async with aiohttp.ClientSession() as snapshot_session:
+                    details = await self.dexscreener.get_token_details_batch(
+                        snapshot_session, [t['address'] for t in selected_tokens]
+                    )
+                snapshot_time = datetime.fromtimestamp(end_time)
+                snapshots = [
+                    (snapshot_time, item['address'], item.get('liquidity'),
+                     item.get('fdv'), 'dexscreener')
+                    for item in details
+                    if item.get('address') and item.get('liquidity') is not None
+                ]
+                inserted_snapshots = await self.db.batch_insert_liquidity_snapshots(snapshots)
+                logger.info(f"Liquidity snapshots stored: {inserted_snapshots}")
+            except Exception as exc:
+                # OHLCV collection remains usable when the optional snapshot
+                # provider is unavailable; the missing depth is visible in
+                # the separate table and never silently backfilled.
+                logger.warning(f"Liquidity snapshot collection unavailable: {type(exc).__name__}")
+        logger.success(f"Pipeline complete. New candles stored: {total_candles}")
+        return {'inserted': total_candles, 'tokens': len(selected_tokens),
+                'end_time': end_time, 'liquidity_snapshots': inserted_snapshots if 'inserted_snapshots' in locals() else 0}
