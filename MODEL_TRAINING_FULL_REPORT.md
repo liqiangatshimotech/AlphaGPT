@@ -182,3 +182,9 @@
 - `logs/research-causal-03/`
 - `logs/genetic-walkforward-06/`
 - `logs/holdout-baselines-03/`
+
+## 10. 分支决策
+
+经过数据质量、成本和短周期基线检查，`train/new-model-20260919` 暂不继续扩大搜索。该分支保留完整的短周期、Dexscreener 规则、流动性快照和执行回测实现，作为后续研究对照。
+
+本轮按要求回到 `codex/safety-vocab-endpoint-fixes`，恢复项目初始 AlphaGPT 入口 `python -m model_core.engine`。原始入口不使用 action mask、短周期特征或 Dexscreener 门槛；训练结果单独写入日志，完成后再与本报告中的改进方案比较。
