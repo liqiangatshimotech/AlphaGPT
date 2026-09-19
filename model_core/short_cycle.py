@@ -21,7 +21,29 @@ FIELDS = ('open', 'high', 'low', 'close', 'volume', 'liquidity', 'fdv')
 SCORES = ('impulse', 'reversal', 'volume_breakout')
 
 
-def snapshot_frame(snapshot=None):
+def fresh_dex_addresses(min_snapshots=0, max_age_minutes=15, min_liquidity=500000, min_volume_5m=10000, min_txns_5m=10):
+    if min_snapshots <= 0:
+        return None
+    from .config import ModelConfig
+    engine = sqlalchemy.create_engine(ModelConfig.DB_URL)
+    query = sqlalchemy.text('SELECT address,time,liquidity,volume_5m,txns_5m FROM liquidity_snapshots WHERE source=\'dexscreener\' ORDER BY address,time')
+    with engine.connect() as c:
+        frame = pd.read_sql(query, c)
+    if frame.empty:
+        return set()
+    frame['time'] = pd.to_datetime(frame['time']); now = pd.Timestamp.now(tz=None)
+    keep=set()
+    for address, group in frame.groupby('address'):
+        group=group.sort_values('time'); last=group.iloc[-1]
+        if (len(group)>=min_snapshots and (now-last.time).total_seconds()/60<=max_age_minutes
+                and pd.notna(last.liquidity) and last.liquidity>=min_liquidity
+                and pd.notna(last.volume_5m) and last.volume_5m>=min_volume_5m
+                and pd.notna(last.txns_5m) and last.txns_5m>=min_txns_5m):
+            keep.add(address)
+    return keep
+
+
+def snapshot_frame(snapshot=None, allowed_addresses=None):
     if snapshot:
         frame = pd.read_csv(snapshot, parse_dates=['time'])
     else:
@@ -34,6 +56,8 @@ def snapshot_frame(snapshot=None):
                     'FROM ohlcv ORDER BY address,time'), connection)
         finally:
             engine.dispose()
+    if allowed_addresses is not None:
+        frame=frame[frame['address'].isin(allowed_addresses)].copy()
     if frame.empty:
         raise ValueError('No minute candles')
     frame['time'] = pd.to_datetime(frame['time'])
@@ -202,9 +226,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', required=True)
     parser.add_argument('--snapshot', help='Frozen source CSV(.gz); otherwise read DB only')
+    parser.add_argument('--min-dex-snapshots', type=int, default=0)
+    parser.add_argument('--max-dex-age-minutes', type=float, default=15)
     args = parser.parse_args()
     out = Path(args.out); out.mkdir(parents=True, exist_ok=False)
-    frame = snapshot_frame(args.snapshot)
+    allowed = fresh_dex_addresses(args.min_dex_snapshots, args.max_dex_age_minutes)
+    frame = snapshot_frame(args.snapshot, allowed)
     minute_times = pd.date_range(frame.time.min(), frame.time.max(), freq='1min')
     train_end, val_end = int(len(minute_times)*.6), int(len(minute_times)*.8)
     if train_end < 100:
