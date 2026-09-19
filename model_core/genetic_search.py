@@ -132,7 +132,7 @@ def score_formula(seq, vm, feat, raw, target, windows, cache):
         cache[seq] = (-10.0, {})
         return cache[seq]
     threshold = percentile_threshold(factor, windows[0][0], windows[0][1])
-    reports = [metrics(factor, raw, target, a, b, threshold=threshold, top_k=1)
+    reports = [metrics(factor, raw, target, a, b, threshold=threshold, top_k=1, min_hold=5, cooldown=3)
                for a, b in windows]
     reward = float(torch.tensor([x['reward'] for x in reports]).median())
     # Prefer simple formulas when their robust score is comparable.
@@ -183,13 +183,13 @@ def main():
     for _, seq in best_train:
         factor = vm.execute(seq, feat)
         threshold = percentile_threshold(factor, train_windows[0][0], train_windows[0][1])
-        reports = [metrics(factor, raw, target, a, b, threshold=threshold, top_k=1) for a, b in val_windows]
+        reports = [metrics(factor, raw, target, a, b, threshold=threshold, top_k=1, min_hold=5, cooldown=3) for a, b in val_windows]
         score = float(torch.tensor([x['reward'] for x in reports]).median())
         val_ranked.append((score, seq, threshold, reports))
     val_ranked.sort(reverse=True)
     _, formula, threshold, validation = val_ranked[0]
     factor = vm.execute(formula, feat)
-    report = {'config': vars(args), 'seed': 42, 'split_indices': [20, cut, val, T], 'train_windows': train_windows, 'validation_windows': val_windows, 'formula': list(formula), 'threshold': threshold, 'vocab_version': FORMULA_VOCAB_VERSION, 'token_names': list(V.token_names), 'train': score_formula(formula, vm, feat, raw, target, train_windows, cache)[1]['windows'], 'validation': validation, 'test': metrics(factor, raw, target, val, T, threshold=threshold, top_k=1), 'tested_candidates': len(val_ranked), 'limitations': ['Research only; top-one execution approximation.', 'Token universe still selected by all-history coverage.', 'Final test is historical and has been inspected previously; fresh forward data is required.', 'Formula preprocessing must be reproduced by the live runner before deployment.']}
+    report = {'config': vars(args), 'seed': 42, 'split_indices': [20, cut, val, T], 'train_windows': train_windows, 'validation_windows': val_windows, 'formula': list(formula), 'threshold': threshold, 'execution': {'top_k': 1, 'min_hold': 5, 'cooldown': 3}, 'vocab_version': FORMULA_VOCAB_VERSION, 'token_names': list(V.token_names), 'train': score_formula(formula, vm, feat, raw, target, train_windows, cache)[1]['windows'], 'validation': validation, 'test': metrics(factor, raw, target, val, T, threshold=threshold, top_k=1, min_hold=5, cooldown=3), 'tested_candidates': len(val_ranked), 'limitations': ['Research only; top-one execution approximation.', 'Token universe still selected by all-history coverage.', 'Final test is historical and has been inspected previously; fresh forward data is required.', 'Formula preprocessing must be reproduced by the live runner before deployment.']}
     (out / 'report.json').write_text(json.dumps(report, indent=2))
     (out / 'candidates.json').write_text(json.dumps([{'score': s, 'formula': list(f), 'threshold': t} for s, f, t, _ in val_ranked], indent=2))
     print(json.dumps(report), flush=True)

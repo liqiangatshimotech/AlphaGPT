@@ -58,7 +58,28 @@ def causal_features(raw):
     return torch.stack(out,1)
 
 
-def metrics(factor,raw,target,a,b,threshold=1.734601,top_k=0):
+def _stateful_top1(scores, eligible, threshold, min_hold=5, cooldown=3):
+    """One-position execution with entry threshold, minimum hold and cooldown."""
+    n, tmax = scores.shape
+    pos = torch.zeros_like(scores)
+    active, age, wait = -1, 0, 0
+    for t in range(tmax):
+        if active >= 0:
+            keep = bool(eligible[active, t] and scores[active, t] >= threshold)
+            if age < min_hold or keep:
+                pos[active, t] = 1.0; age += 1; continue
+            active, age, wait = -1, 0, cooldown
+        if wait > 0:
+            wait -= 1; continue
+        column = scores[:, t].masked_fill(~eligible[:, t], -torch.inf)
+        winner = int(torch.argmax(column))
+        if torch.isfinite(column[winner]) and float(column[winner]) >= threshold:
+            active, age = winner, 1
+            pos[active, t] = 1.0
+    return pos
+
+
+def metrics(factor,raw,target,a,b,threshold=1.734601,top_k=0,min_hold=5,cooldown=3):
     # Targets use t+1 and t+2: purge the final two decision rows of each segment.
     b-=2
     liq=raw['liquidity'][:,a:b]
@@ -66,12 +87,15 @@ def metrics(factor,raw,target,a,b,threshold=1.734601,top_k=0):
     eligible=(liq>500000)&valid
     scores=factor[:,a:b]
     if top_k:
-        k=min(top_k,scores.shape[0])
-        rank_scores=scores.masked_fill(~eligible,-torch.inf)
-        winners=torch.topk(rank_scores,k,dim=0).indices
-        pos=torch.zeros_like(scores)
-        pos.scatter_(0,winners,torch.gather((scores>threshold).float(),0,winners))
-        pos*=eligible.float()
+        if top_k == 1:
+            pos=_stateful_top1(scores,eligible,threshold,min_hold=min_hold,cooldown=cooldown)
+        else:
+            k=min(top_k,scores.shape[0])
+            rank_scores=scores.masked_fill(~eligible,-torch.inf)
+            winners=torch.topk(rank_scores,k,dim=0).indices
+            pos=torch.zeros_like(scores)
+            pos.scatter_(0,winners,torch.gather((scores>threshold).float(),0,winners))
+            pos*=eligible.float()
     else:
         pos=((scores>threshold)&eligible).float()
     prev=torch.cat([torch.zeros_like(pos[:,:1]),pos[:,:-1]],1)
@@ -85,10 +109,13 @@ def metrics(factor,raw,target,a,b,threshold=1.734601,top_k=0):
     dd=float((peak-curve).max())
     net=float(curve[-1]); entries=int(((pos>0)&(prev==0)).sum())
     if top_k:
-        hold_scores=liq.masked_fill(~eligible,-torch.inf)
-        winners=torch.topk(hold_scores,min(top_k,hold_scores.shape[0]),dim=0).indices
-        hold=torch.zeros_like(hold_scores)
-        hold.scatter_(0,winners,torch.gather(eligible.float(),0,winners))
+        if top_k == 1:
+            hold=_stateful_top1(liq,eligible,float('-inf'),min_hold=min_hold,cooldown=cooldown)
+        else:
+            hold_scores=liq.masked_fill(~eligible,-torch.inf)
+            winners=torch.topk(hold_scores,min(top_k,hold_scores.shape[0]),dim=0).indices
+            hold=torch.zeros_like(hold_scores)
+            hold.scatter_(0,winners,torch.gather(eligible.float(),0,winners))
     else:
         hold=eligible.float()
     hold_prev=torch.cat([torch.zeros_like(hold[:,:1]),hold[:,:-1]],1)
