@@ -48,10 +48,10 @@ def simulate(
     ``e`` are skipped.  The next decision is at ``e+cooldown`` and the next
     possible entry is open ``e+cooldown+1``.  No decision can both exit and enter.
 
-    Entry impact above ``max_impact`` is rejected. Exits above it are flagged
-    unavailable as reliable executions; an uncapped cost diagnostic is retained
-    if proceeds can be valued. Missing equity marks are represented by None;
-    an unresolved final position makes final P&L None instead of -100%.
+    Entry impact above ``max_impact`` is rejected. Exits above it are recorded
+    as risk events but still charged at their uncapped simulated cost. Missing
+    future data sets ``available=False`` and increments ``unresolved_missing``;
+    numeric output fields remain finite and must not be used as a valid score.
     """
     scores = np.asarray(scores, dtype=float)
     if scores.ndim != 2:
@@ -90,7 +90,9 @@ def simulate(
         if value is not None and (not math.isfinite(value) or not 0 < value < 1):
             raise ValueError(f'{name} must be a fraction between zero and one')
     exit_threshold = entry_threshold if exit_threshold is None else exit_threshold
-    if not math.isfinite(entry_threshold) or math.isnan(exit_threshold):
+    # +/-inf thresholds are useful for a buy-and-hold baseline; NaN is never
+    # a meaningful trading threshold.
+    if math.isnan(float(entry_threshold)) or math.isnan(float(exit_threshold)):
         raise ValueError('invalid entry or exit threshold')
 
     cash = float(notional)
@@ -109,7 +111,7 @@ def simulate(
     events = []
     per_token = np.zeros(n, dtype=float)
     traded_tokens = set()
-    equity_path: list[float | None] = [1.0]
+    equity_path: list[float] = [1.0]
     equity_bars = [int(start)]
     available = True
     bankrupt = False
