@@ -22,7 +22,7 @@ async def snapshot_once(db, birdeye, dex, limit=50):
     # prior observation under the (time,address,source) primary key.
     now = datetime.now()
     rows = [
-        (now, token['address'], token.get('liquidity'), token.get('fdv'), 'birdeye_trending')
+        (now, token['address'], token.get('liquidity'), token.get('fdv'), None, None, 'birdeye_trending')
         for token in tokens
         if token.get('address') and token.get('liquidity') is not None
     ]
@@ -32,7 +32,8 @@ async def snapshot_once(db, birdeye, dex, limit=50):
         async with aiohttp.ClientSession() as session:
             details = await dex.get_token_details_batch(session, [t['address'] for t in tokens])
         rows.extend(
-            (now, item['address'], item.get('liquidity'), item.get('fdv'), 'dexscreener')
+            (now, item['address'], item.get('liquidity'), item.get('fdv'),
+             item.get('volume_5m'), item.get('txns_5m_buys', 0) + item.get('txns_5m_sells', 0), 'dexscreener')
             for item in details
             if item.get('address') and item.get('liquidity') is not None
         )

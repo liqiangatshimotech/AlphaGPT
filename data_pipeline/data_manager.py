@@ -95,7 +95,7 @@ class DataManager:
             # unreachable. This is point-in-time data only.
             snapshots = [
                 (snapshot_time, item['address'], item.get('liquidity'),
-                 item.get('fdv'), 'birdeye_trending')
+                 item.get('fdv'), None, None, 'birdeye_trending')
                 for item in selected_tokens
                 if item.get('address') and item.get('liquidity') is not None
             ]
@@ -110,7 +110,8 @@ class DataManager:
                         )
                 snapshots.extend([
                     (snapshot_time, item['address'], item.get('liquidity'),
-                     item.get('fdv'), 'dexscreener')
+                     item.get('fdv'), item.get('volume_5m'),
+                     item.get('txns_5m_buys', 0) + item.get('txns_5m_sells', 0), 'dexscreener')
                     for item in details
                     if item.get('address') and item.get('liquidity') is not None
                 ])

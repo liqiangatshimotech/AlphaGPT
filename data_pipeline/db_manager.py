@@ -61,6 +61,8 @@ class DBManager:
                     address TEXT NOT NULL,
                     liquidity DOUBLE PRECISION,
                     fdv DOUBLE PRECISION,
+                    volume_5m DOUBLE PRECISION,
+                    txns_5m INT,
                     source TEXT NOT NULL,
                     PRIMARY KEY (time, address, source)
                 );
@@ -69,6 +71,8 @@ class DBManager:
                 "CREATE INDEX IF NOT EXISTS idx_liquidity_snapshots_address_time "
                 "ON liquidity_snapshots (address, time);"
             )
+            await conn.execute("ALTER TABLE liquidity_snapshots ADD COLUMN IF NOT EXISTS volume_5m DOUBLE PRECISION")
+            await conn.execute("ALTER TABLE liquidity_snapshots ADD COLUMN IF NOT EXISTS txns_5m INT")
 
     async def upsert_tokens(self, tokens):
         if not tokens: return
@@ -118,9 +122,10 @@ class DBManager:
             return 0
         async with self.pool.acquire() as conn:
             result = await conn.executemany("""
-                INSERT INTO liquidity_snapshots (time, address, liquidity, fdv, source)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO liquidity_snapshots (time, address, liquidity, fdv, volume_5m, txns_5m, source)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (time, address, source) DO UPDATE SET
-                    liquidity=EXCLUDED.liquidity, fdv=EXCLUDED.fdv
+                    liquidity=EXCLUDED.liquidity, fdv=EXCLUDED.fdv,
+                    volume_5m=EXCLUDED.volume_5m, txns_5m=EXCLUDED.txns_5m
             """, records)
             return len(records)
