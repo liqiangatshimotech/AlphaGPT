@@ -149,59 +149,34 @@ def resample_ohlcv(
     if frame.empty:
         return pd.DataFrame(columns=output_columns)
 
-    records: list[dict] = []
-    # Stable sort makes first/last deterministic for input in arbitrary order.
-    frame = frame.sort_values([group_name, "__bucket", time_col], kind="mergesort")
-    for group_value, grouped in frame.groupby(group_name, sort=False, dropna=False):
-        buckets = grouped["__bucket"]
-        if include_empty:
-            start, end = buckets.min(), buckets.max()
-            bucket_values = pd.date_range(start=start, end=end, freq=target)
-        else:
-            bucket_values = pd.Index(pd.unique(buckets)).sort_values()
-        for bucket in bucket_values:
-            part = grouped[grouped["__bucket"] == bucket]
-            valid = part[part["__valid"]]
-            # Exact alignment and uniqueness have been checked above.
-            valid_times = valid[time_col].dt.floor(source).drop_duplicates()
-            valid_count = int(len(valid_times))
-            source_count = int(part[time_col].dt.floor(source).drop_duplicates().size)
-            complete = valid_count == expected
-            row: dict = {time_col: bucket}
-            if has_group:
-                row[group_col] = group_value
-            if valid.empty:
-                for name in value_columns:
-                    row[name] = np.nan
-            else:
-                # Value columns are numeric in the database; coercion here
-                # keeps malformed rows from leaking strings into aggregates.
-                for name in PRICE_COLUMNS:
-                    values = pd.to_numeric(valid[name], errors="coerce")
-                    if name == "open":
-                        row[name] = float(values.iloc[0])
-                    elif name == "high":
-                        row[name] = float(values.max())
-                    elif name == "low":
-                        row[name] = float(values.min())
-                    elif name == "close":
-                        row[name] = float(values.iloc[-1])
-                if "volume" in value_columns:
-                    row["volume"] = float(pd.to_numeric(valid["volume"], errors="coerce").sum())
-                for name in ("liquidity", "fdv"):
-                    if name in value_columns:
-                        values = pd.to_numeric(valid[name], errors="coerce")
-                        row[name] = float(values.iloc[-1])
-            row.update({"observed": bool(complete), "complete": bool(complete),
-                        "source_count": source_count, "valid_count": valid_count})
-            records.append(row)
-
-    result = pd.DataFrame.from_records(records, columns=output_columns)
-    if has_group:
-        result = result.sort_values([group_col, time_col], kind="mergesort")
-    else:
-        result = result.sort_values([time_col], kind="mergesort")
-    return result.reset_index(drop=True)
+    # Aggregate all buckets in one groupby rather than scanning every token
+    # frame again for every bucket. This matters for minute-level history.
+    frame = frame.sort_values([group_name, time_col], kind="mergesort")
+    keys = [group_name, "__bucket"]
+    grouped = frame.groupby(keys, sort=True)
+    counts = grouped.size().rename("source_count").to_frame()
+    valid = frame.loc[frame["__valid"]]
+    rules = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    rules.update({name: "sum" if name == "volume" else "last"
+                  for name in OPTIONAL_COLUMNS if name in frame})
+    aggregates = valid.groupby(keys, sort=True).agg(rules)
+    counts["valid_count"] = valid.groupby(keys).size()
+    result = counts.join(aggregates)
+    if include_empty:
+        indexes = [pd.MultiIndex.from_product(
+            [[name], pd.date_range(part["__bucket"].min(), part["__bucket"].max(), freq=target)],
+            names=keys) for name, part in frame.groupby(group_name, sort=False)]
+        index = indexes[0]
+        for extra in indexes[1:]:
+            index = index.append(extra)
+        result = result.reindex(index)
+    for name in ("source_count", "valid_count"):
+        result[name] = result[name].fillna(0).astype(int)
+    result["observed"] = result["valid_count"].eq(expected)
+    result["complete"] = result["observed"]
+    result = result.reset_index().rename(columns={"__bucket": time_col})
+    result = result.sort_values(([group_col] if has_group else []) + [time_col], kind="mergesort")
+    return result[output_columns].reset_index(drop=True)
 
 
 # Descriptive aliases make the helper convenient for callers that use either

@@ -1,9 +1,9 @@
-"""Causal, single-position evaluator for frozen research signals.
+"""Causal, single-position evaluator with next-open order execution.
 
-The evaluator is intentionally independent of ``MemeBacktest``: a decision at
-bar ``t`` can only use fields at ``t`` and enters at the next observed open.
-Missing execution data is reported as unavailable instead of being treated as a
-zero return.
+Signal/data-quality masks describe the completed current bar.  Fill availability
+is deliberately separate: a future bar's completed OHLCV mask cannot decide
+whether its opening price was available.  Missing fills or valuations are
+reported, never converted into a fictitious zero-price liquidation.
 """
 from __future__ import annotations
 
@@ -24,119 +24,262 @@ def simulate(
     cooldown: int = 3,
     notional: float = 1000.0,
     fee: float = 0.006,
+    eligible: np.ndarray | None = None,
+    min_hold_bars: int = 1,
+    min_liquidity: float = 0.0,
+    max_impact: float = 0.05,
+    stop_loss: float | None = None,
+    liquidity_drop_fraction: float | None = None,
 ) -> Dict[str, Any]:
-    """Simulate one top-ranked position with causal next-open fills.
+    """Simulate one top-ranked position using information available at close t.
 
-    ``scores`` and arrays are shaped ``[tokens, bars]``.  ``raw['observed']``
-    is a data-quality mask, not a future tradability oracle.  ``end`` is
-    exclusive.  Returns a JSON-serialisable diagnostic dictionary.
+    Decisions at ``t`` execute at open ``t+1``.  A position entered at open
+    ``f`` reaches its maximum duration at open ``f+hold_bars``.  The minimum
+    duration restricts signal exits; missing data, liquidity risk, stop loss,
+    maximum duration, and end-of-segment liquidation take precedence.
+
+    Arrays have shape ``[tokens, bars]``. ``eligible`` is an optional current
+    signal mask; it never changes ``raw['observed']``.  ``open_available`` in
+    raw controls fills (default: a finite positive open).  Execution liquidity
+    comes from ``execution_liquidity`` when supplied, else ``liquidity``; callers
+    must provide the liquidity known at that open, not end-of-bar snapshots.
+
+    After an exit at open ``e``, ``cooldown`` full decision bars beginning at
+    ``e`` are skipped.  The next decision is at ``e+cooldown`` and the next
+    possible entry is open ``e+cooldown+1``.  No decision can both exit and enter.
+
+    Entry impact above ``max_impact`` is rejected. Exits above it are flagged
+    unavailable as reliable executions; an uncapped cost diagnostic is retained
+    if proceeds can be valued. Missing equity marks are represented by None;
+    an unresolved final position makes final P&L None instead of -100%.
     """
     scores = np.asarray(scores, dtype=float)
-    open_ = np.asarray(raw['open'], dtype=float)
-    close = np.asarray(raw.get('close', open_), dtype=float)
-    liq = np.asarray(raw['liquidity'], dtype=float)
-    observed = np.asarray(raw['observed'], dtype=bool)
+    if scores.ndim != 2:
+        raise ValueError('scores must have shape [tokens, bars]')
     n, total = scores.shape
-    if any(x.shape != (n, total) for x in (open_, close, liq, observed)):
-        raise ValueError('scores and raw arrays must have the same shape')
-    if not 0 <= start < end <= total or hold_bars < 1 or cooldown < 0:
+
+    def array(name, default=None, dtype=float):
+        value = raw[name] if name in raw else default
+        if value is None:
+            raise ValueError(f'missing raw array: {name}')
+        result = np.asarray(value, dtype=dtype)
+        if result.shape != (n, total):
+            raise ValueError('scores and raw arrays must have the same shape')
+        return result
+
+    open_ = array('open')
+    close = array('close', open_)
+    liq = array('liquidity')
+    observed = array('observed', dtype=bool)
+    open_available = array('open_available', np.isfinite(open_) & (open_ > 0), bool)
+    execution_liq = array('execution_liquidity', liq)
+    signal_eligible = np.ones_like(observed) if eligible is None else np.asarray(eligible, dtype=bool)
+    if signal_eligible.shape != (n, total):
+        raise ValueError('eligible must have the same shape as scores')
+    if (not 0 <= start < end <= total or n < 1 or
+            not isinstance(hold_bars, (int, np.integer)) or hold_bars < 1 or
+            not isinstance(min_hold_bars, (int, np.integer)) or not 1 <= min_hold_bars <= hold_bars or
+            not isinstance(cooldown, (int, np.integer)) or cooldown < 0):
         raise ValueError('invalid simulation range or holding parameters')
+    if (not math.isfinite(notional) or notional <= 0 or
+            not math.isfinite(fee) or not 0 <= fee < 1 or
+            not math.isfinite(min_liquidity) or min_liquidity < 0 or
+            not math.isfinite(max_impact) or not 0 <= max_impact < 1):
+        raise ValueError('invalid notional, cost, or liquidity parameter')
+    for name, value in [('stop_loss', stop_loss), ('liquidity_drop_fraction', liquidity_drop_fraction)]:
+        if value is not None and (not math.isfinite(value) or not 0 < value < 1):
+            raise ValueError(f'{name} must be a fraction between zero and one')
     exit_threshold = entry_threshold if exit_threshold is None else exit_threshold
+    if not math.isfinite(entry_threshold) or math.isnan(exit_threshold):
+        raise ValueError('invalid entry or exit threshold')
 
     cash = float(notional)
     qty = 0.0
     token = -1
     entry_price = 0.0
-    entry_bar = -1
-    cooldown_left = 0
+    entry_fill = -1
+    entry_liquidity = 0.0
+    next_entry_decision = start
     entries = 0
     gross_pnl = 0.0
     costs = 0.0
     unresolved = []
+    risk_events = []
+    rejections = []
     events = []
     per_token = np.zeros(n, dtype=float)
-    equity_path = [cash]
+    traded_tokens = set()
+    equity_path: list[float | None] = [1.0]
+    equity_bars = [int(start)]
     available = True
     bankrupt = False
+    exposed_intervals = 0
+    pending_exit_reason: str | None = None
 
-    def rate(i: int, bar: int, size: float) -> float:
-        if not math.isfinite(liq[i, bar]) or liq[i, bar] <= 0:
-            raise ValueError('missing or non-positive liquidity at execution')
-        return float(fee + min(0.05, size / liq[i, bar]))
+    def missing(bar: int, i: int, reason: str) -> None:
+        nonlocal available
+        available = False
+        unresolved.append({'bar': int(bar), 'token': int(i), 'reason': reason})
 
-    def close_position(i: int, why: str) -> None:
-        nonlocal cash, qty, token, entry_price, entry_bar, available, gross_pnl, costs
-        if token < 0:
-            return
-        if not observed[token, i] or not math.isfinite(open_[token, i]) or open_[token, i] <= 0:
-            available = False; unresolved.append({'bar': i, 'token': int(token), 'reason': 'missing_exit_open'}); return
-        px = float(open_[token, i]); size = qty * px
-        try: r = rate(token, i, size)
-        except ValueError:
-            available = False; unresolved.append({'bar': i, 'token': int(token), 'reason': 'missing_exit_liquidity'}); return
-        proceeds = size * (1.0 - r)
+    def valid_open(i: int, bar: int) -> bool:
+        return bool(open_available[i, bar] and math.isfinite(open_[i, bar]) and open_[i, bar] > 0)
+
+    def close_position(bar: int, why: str) -> bool:
+        nonlocal cash, qty, token, entry_price, entry_fill, entry_liquidity
+        nonlocal available, gross_pnl, costs, next_entry_decision, pending_exit_reason
+        if not valid_open(token, bar):
+            missing(bar, token, 'missing_exit_open')
+            return False
+        liquidity = float(execution_liq[token, bar])
+        if not math.isfinite(liquidity) or liquidity <= 0:
+            missing(bar, token, 'missing_exit_liquidity')
+            return False
+        px = float(open_[token, bar])
+        size = qty * px
+        impact = size / liquidity
+        if liquidity < min_liquidity or impact > max_impact:
+            available = False
+            risk_events.append({'bar': int(bar), 'token': int(token),
+                                'reason': 'exit_liquidity_limit', 'impact': float(impact),
+                                'liquidity': liquidity})
+        rate = fee + impact
+        if rate >= 1:
+            missing(bar, token, 'exit_impact_unpriceable')
+            return False
         principal = qty * entry_price
-        pnl = proceeds - principal
-        gross_pnl += size - principal
-        costs += size * r
-        cash += proceeds
-        per_token[token] += pnl / notional
-        events.append({'bar': int(i), 'type': 'exit', 'token': int(token), 'reason': why, 'pnl_fraction': float(pnl / notional)})
-        qty = 0.0; token = -1; entry_price = 0.0; entry_bar = -1
+        exit_cost = size * rate
+        gross = size - principal
+        cash += size - exit_cost
+        gross_pnl += gross
+        costs += exit_cost
+        # Entry costs were charged when bought, so the token total and the
+        # gross-minus-cost identity both include each side exactly once.
+        per_token[token] += (gross - exit_cost) / notional
+        events.append({'bar': int(bar), 'type': 'exit', 'token': int(token),
+                       'reason': why, 'price': px, 'held_bars': int(bar - entry_fill),
+                       'pnl_fraction': float((gross - exit_cost) / notional),
+                       'cost_fraction': float(exit_cost / notional), 'impact': float(impact)})
+        qty = 0.0
+        token = -1
+        entry_price = 0.0
+        entry_fill = -1
+        entry_liquidity = 0.0
+        pending_exit_reason = None
+        next_entry_decision = bar + cooldown
+        return True
+
+    def mark_equity(bar: int) -> float | None:
+        if token < 0:
+            return float(cash / notional)
+        if not valid_open(token, bar):
+            missing(bar, token, 'missing_mark_open')
+            return None
+        return float((cash + qty * open_[token, bar]) / notional)
 
     for t in range(start, end - 1):
-        # An active position is exited at the next open after minimum duration,
-        # or after a causal score/eligibility failure at the current bar.
-        if token >= 0:
-            age = t - entry_bar
-            bad_signal = (not observed[token, t]) or (not math.isfinite(scores[token, t])) or scores[token, t] < exit_threshold
-            if age >= hold_bars or bad_signal:
-                close_position(t + 1, 'hold' if age >= hold_bars else 'signal')
-                if token < 0:
-                    cooldown_left = cooldown
-        if token < 0:
-            if cooldown_left:
-                cooldown_left -= 1
+        fill = t + 1
+        held_at_decision = token >= 0
+        # Existing holdings are exposed to the movement from open t to open
+        # t+1; positions first bought at t+1 are not exposed during this span.
+        exposed_intervals += int(held_at_decision)
+        if held_at_decision:
+            held_after_fill = fill - entry_fill
+            why = pending_exit_reason
+            current_liq = float(liq[token, t])
+            # Safety checks may bypass the minimum hold, and do not promise a
+            # realizable exit when the pool or quote has disappeared.
+            if why is None:
+                if not observed[token, t]:
+                    why = 'missing_signal_data'
+                elif not math.isfinite(current_liq) or current_liq <= 0 or current_liq < min_liquidity:
+                    why = 'liquidity'
+                elif (stop_loss is not None and math.isfinite(close[token, t]) and
+                      close[token, t] > 0 and close[token, t] / entry_price - 1 <= -stop_loss):
+                    why = 'stop_loss'
+                elif liquidity_drop_fraction is not None:
+                    reference = entry_liquidity
+                    if t > 0 and observed[token, t - 1] and math.isfinite(liq[token, t - 1]):
+                        reference = max(reference, float(liq[token, t - 1]))
+                    if reference > 0 and current_liq / reference <= 1 - liquidity_drop_fraction:
+                        why = 'liquidity_drop'
+            if why is None and held_after_fill >= hold_bars:
+                why = 'hold'
+            if why is None and held_after_fill >= min_hold_bars:
+                if (not signal_eligible[token, t] or not math.isfinite(scores[token, t]) or
+                        scores[token, t] < exit_threshold):
+                    why = 'signal'
+            if fill == end - 1:
+                why = why or 'segment_end'
+            if why is not None:
+                pending_exit_reason = why
+                close_position(fill, why)
+        elif fill < end - 1 and t >= next_entry_decision:
+            if cash < notional * 0.05:
+                bankrupt = True
             else:
                 current = scores[:, t]
-                eligible = observed[:, t] & np.isfinite(current) & (liq[:, t] > 0) & (current >= entry_threshold)
-                if np.any(eligible):
-                    i = int(np.nanargmax(np.where(eligible, current, -np.inf)))
-                    if cash < notional * 0.05:
-                        bankrupt = True
-                        break
-                    fill = t + 1
-                    if (not observed[i, fill]) or (not math.isfinite(open_[i, fill])) or open_[i, fill] <= 0:
-                        available = False; unresolved.append({'bar': fill, 'token': i, 'reason': 'missing_entry_open'}); continue
-                    try: r = rate(i, fill, notional)
-                    except ValueError:
-                        available = False; unresolved.append({'bar': fill, 'token': i, 'reason': 'missing_entry_liquidity'}); continue
-                    px = float(open_[i, fill]); spend = min(notional, cash / (1.0 + r))
-                    if spend <= 0:
-                        bankrupt = True; available = False; break
-                    qty = spend / px; cash -= spend * (1.0 + r); costs += spend * r
-                    token, entry_price, entry_bar = i, px, t
-                    entries += 1
-                    events.append({'bar': int(fill), 'type': 'entry', 'token': i, 'price': px})
-        mark = cash
-        if token >= 0 and observed[token, t + 1] and math.isfinite(open_[token, t + 1]) and open_[token, t + 1] > 0:
-            mark += qty * float(open_[token, t + 1])
-        equity_path.append(mark)
+                candidates = (observed[:, t] & signal_eligible[:, t] & np.isfinite(current) &
+                              np.isfinite(liq[:, t]) & (liq[:, t] > 0) &
+                              (liq[:, t] >= min_liquidity) & (current >= entry_threshold))
+                if np.any(candidates):
+                    i = int(np.argmax(np.where(candidates, current, -np.inf)))
+                    if not valid_open(i, fill):
+                        missing(fill, i, 'missing_entry_open')
+                    else:
+                        liquidity = float(execution_liq[i, fill])
+                        if not math.isfinite(liquidity) or liquidity <= 0:
+                            missing(fill, i, 'missing_entry_liquidity')
+                        else:
+                            # Solve spend*(1+fee)+spend**2/liquidity <= cash,
+                            # avoiding an implicit excess debit as cash shrinks.
+                            affordable = 2 * cash / ((1 + fee) + math.sqrt((1 + fee) ** 2 + 4 * cash / liquidity))
+                            spend = min(notional, affordable)
+                            impact = spend / liquidity
+                            if liquidity < min_liquidity or impact > max_impact:
+                                rejections.append({'bar': int(fill), 'token': i,
+                                                   'reason': 'entry_liquidity_limit',
+                                                   'liquidity': liquidity, 'impact': float(impact)})
+                            else:
+                                px = float(open_[i, fill])
+                                entry_cost = spend * (fee + impact)
+                                qty = spend / px
+                                cash = max(0.0, cash - spend - entry_cost)
+                                costs += entry_cost
+                                per_token[i] -= entry_cost / notional
+                                token, entry_price, entry_fill = i, px, fill
+                                entry_liquidity = liquidity
+                                entries += 1
+                                traded_tokens.add(i)
+                                events.append({'bar': int(fill), 'decision_bar': int(t),
+                                               'type': 'entry', 'token': i, 'price': px,
+                                               'cost_fraction': float(entry_cost / notional),
+                                               'impact': float(impact)})
+        equity_path.append(mark_equity(fill))
+        equity_bars.append(int(fill))
 
-    # Force-close any outstanding position at the final available open.
-    if token >= 0:
-        close_position(end - 1, 'segment_end')
-    final_equity = cash
-    curve = np.asarray(equity_path, dtype=float) / notional
-    peak = np.maximum.accumulate(curve)
-    max_dd = float(np.max(peak - curve)) if curve.size else 0.0
-    net = float(final_equity / notional - 1.0)
+    fully_valued = all(value is not None for value in equity_path)
+    if fully_valued:
+        curve = np.asarray(equity_path, dtype=float)
+        peak = np.maximum.accumulate(curve)
+        max_dd = float(np.max(np.divide(peak - curve, peak, out=np.zeros_like(curve), where=peak > 0)))
+    else:
+        max_dd = None
+    final_equity = float(cash) if token < 0 else None
+    # A complete final liquidation is not enough to claim a complete equity
+    # curve: if any intermediate mark was unavailable, net performance cannot
+    # be audited from the returned path and is intentionally unknown.
+    net = (float(final_equity / notional - 1.0)
+           if final_equity is not None and fully_valued else None)
+    gross = float(gross_pnl / notional) if token < 0 else None
     return {
-        'available': bool(available and not unresolved), 'unresolved_missing': unresolved,
-        'bankrupt': bool(bankrupt), 'net_pnl_fraction': net,
-        'gross_pnl_fraction': float(gross_pnl / notional), 'cost_fraction': float(costs / notional),
-        'max_drawdown_fraction': max_dd, 'entries': int(entries),
-        'active_tokens': int(np.count_nonzero(per_token)), 'exposure': float(np.mean(np.asarray(equity_path) > notional)),
+        'available': bool(available and not unresolved and token < 0),
+        'unresolved_missing': unresolved, 'risk_events': risk_events,
+        'entry_rejections': rejections, 'bankrupt': bool(bankrupt),
+        'net_pnl_fraction': net, 'gross_pnl_fraction': gross,
+        'cost_fraction': float(costs / notional), 'max_drawdown_fraction': max_dd,
+        'entries': int(entries), 'active_tokens': len(traded_tokens),
+        'exposure': float(exposed_intervals / max(1, end - start - 1)),
         'per_token_pnl_fraction': per_token.tolist(), 'entry_events': events,
-        'equity_path': curve.tolist(),
+        'equity_path': equity_path, 'equity_bars': equity_bars,
+        'final_equity': final_equity, 'open_position_token': int(token),
     }
