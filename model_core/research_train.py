@@ -1,0 +1,103 @@
+"""Isolated causal formula-search experiment; never overwrites live strategy."""
+import argparse
+import json
+from pathlib import Path
+import torch
+from torch.distributions import Categorical
+from .alphagpt import AlphaGPT
+from .data_loader import CryptoDataLoader
+from .ops import OPS_CONFIG
+from .vm import StackVM
+from .vocab import FORMULA_VOCAB as V, FORMULA_VOCAB_VERSION, load_formula
+
+
+def legal_mask(depth, remaining):
+    arities = torch.tensor([0]*V.feature_count + [x[2] for x in OPS_CONFIG], device=depth.device)
+    nxt = depth[:, None] + 1 - arities
+    allowed = (depth[:, None] >= arities) & (nxt >= 1) & (nxt <= 1 + 2*remaining)
+    allowed[:, V.token_names.index('JUMP')] = False  # Uses future time statistics.
+    return allowed
+
+
+def causal_features(raw):
+    c, v = raw['close'], raw['volume']
+    prev = torch.cat([c[:, :1], c[:, :-1]], 1)
+    ret = torch.log(c.clamp_min(1e-12)/prev.clamp_min(1e-12))
+    ret = torch.where(raw['observed'] & torch.cat([torch.zeros_like(raw['observed'][:, :1]),raw['observed'][:, :-1]],1),ret,0)
+    vp = torch.cat([v[:, :1],v[:, :-1]],1)
+    growth = ((v-vp)/(vp+1)).clamp(-5,5)
+    fomo = growth-torch.cat([growth[:, :1],growth[:, :-1]],1)
+    ma = torch.cat([c[:, :1].expand(-1,19),c],1).unfold(1,20,1).mean(-1)
+    channels = [ret, (raw['liquidity']/(raw['fdv']+1e-6)*4).clamp(0,1),
+                torch.tanh((c-raw['open'])/(raw['high']-raw['low']+1e-9)*3),
+                fomo, (c-ma)/(ma+1e-9), torch.log1p(v)]
+    out=[]
+    valid=raw['observed']; count=valid.cumsum(1).clamp_min(1)
+    for i,x in enumerate(channels):
+        x=torch.where(valid,x,0)
+        if i in (0,3,4,5):
+            mean=x.cumsum(1)/count
+            var=(x.square().cumsum(1)/count-mean.square()).clamp_min(0)
+            x=((x-mean)/(var.sqrt()+1e-6)).clamp(-5,5)
+        out.append(torch.where(valid,x,0))
+    return torch.stack(out,1)
+
+
+def metrics(factor,raw,target,a,b):
+    # Targets use t+1 and t+2: purge the final two decision rows of each segment.
+    b-=2
+    liq=raw['liquidity'][:,a:b]
+    valid=raw['tradable'][:,a:b]
+    pos=((factor[:,a:b]>1.734601)&(liq>500000)&valid).float()
+    prev=torch.cat([torch.zeros_like(pos[:,:1]),pos[:,:-1]],1)
+    changes=(pos-prev).abs()
+    rate=.006+(1000/(liq+1e-9)).clamp(0,.05)
+    pnl=pos*target[:,a:b]-changes*rate
+    pnl[:,-1]-=pos[:,-1]*rate[:,-1]  # Forced segment liquidation.
+    # Equal fixed notional per token; report additive P&L units, not compounded ROI.
+    curve=pnl.mean(0).cumsum(0)
+    peak=torch.cat([curve.new_zeros(1),curve]).cummax(0).values[1:]
+    dd=float((peak-curve).max())
+    net=float(curve[-1]); entries=int(((pos>0)&(prev==0)).sum())
+    return dict(net_pnl_per_initial_notional=net,drawdown_additive=dd,
+                turnover_units=float(changes.sum()+pos[:,-1].sum()),entries=entries,
+                exposure=float(pos.mean()),cost_per_initial_notional=float((changes*rate).sum()/pos.shape[0]+(pos[:,-1]*rate[:,-1]).mean()),
+                reward=net-dd if entries>=5 else -1.0)
+
+
+def main():
+    p=argparse.ArgumentParser(); p.add_argument('--steps',type=int,default=30); p.add_argument('--batch',type=int,default=64); p.add_argument('--out',required=True); args=p.parse_args()
+    torch.manual_seed(42); torch.set_num_threads(4)
+    out=Path(args.out); out.mkdir(parents=True,exist_ok=False)
+    loader=CryptoDataLoader(); loader.load_data(); raw=loader.raw_data_cache; feat=causal_features(raw); target=loader.target_ret
+    torch.save({'raw':raw,'target':target,'addresses':loader.addresses},out/'data_snapshot.pt')
+    T=target.shape[1]; cut=int(T*.6); val=int(T*.8)
+    if cut<100 or T-val<10: raise ValueError('Insufficient history')
+    model=AlphaGPT().to(feat.device); model.eval()  # Disable dropout, retain gradients.
+    opt=torch.optim.AdamW(model.parameters(),lr=1e-4); vm=StackVM(); candidates={}; cache={}
+    for step in range(args.steps):
+        inp=torch.zeros(args.batch,1,dtype=torch.long,device=feat.device); depth=torch.zeros(args.batch,dtype=torch.long,device=feat.device); lp=[]; ent=[]
+        for t in range(12):
+            logits,_,_=model(inp); dist=Categorical(logits=logits.masked_fill(~legal_mask(depth,11-t),-torch.inf)); action=dist.sample(); lp.append(dist.log_prob(action)); ent.append(dist.entropy())
+            arities=torch.tensor([0]*V.feature_count+[x[2] for x in OPS_CONFIG],device=feat.device); depth+=1-arities[action]; inp=torch.cat([inp,action[:,None]],1)
+        rewards=[]
+        for seq in inp[:,1:].tolist():
+            key=tuple(load_formula(seq))
+            if key not in cache:
+                f=vm.execute(seq,feat[:,:,:cut]); cache[key]=metrics(f,{k:v[:,:cut] for k,v in raw.items()},target[:,:cut],20,cut)
+            r=cache[key]['reward']; rewards.append(r); candidates[key]=r
+        reward=torch.tensor(rewards,device=feat.device); adv=(reward-reward.mean())/(reward.std()+1e-5)
+        loss=-(torch.stack(lp).sum(0)*adv.detach()).mean()-.01*torch.stack(ent).mean()
+        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1); opt.step()
+        row=dict(step=step+1,mean_reward=float(reward.mean()),best_reward=max(candidates.values()),legal_rate=1.0,unique_formulas=len(candidates))
+        with (out/'history.jsonl').open('a') as f: f.write(json.dumps(row)+'\n')
+        print(json.dumps(row),flush=True)
+    # Only training-ranked finalists enter validation; test is evaluated once after selection.
+    finalists=sorted(candidates,key=candidates.get,reverse=True)[:10]; checked=[]
+    for seq in finalists:
+        f=vm.execute(seq,feat[:,:,:val]); checked.append((metrics(f,raw,target,cut,val)['reward'],seq))
+    _,best=max(checked); f=vm.execute(best,feat)
+    report={'config':vars(args),'seed':42,'split_indices':[20,cut,val,T],'formula':list(best),'vocab_version':FORMULA_VOCAB_VERSION,'token_names':list(V.token_names),'train':metrics(f,raw,target,20,cut),'validation':metrics(f,raw,target,cut,val),'test':metrics(f,raw,target,val,T),'limitations':['Research only: historical universe selection may introduce survivorship bias.','Previously inspected historical test period; fresh forward data required.','Additive fixed-notional approximation; gaps and execution fills not fully simulated.','Feature preprocessing differs from production runner; do not deploy this formula directly.']}
+    (out/'report.json').write_text(json.dumps(report,indent=2)); torch.save({'model':model.state_dict(),'optimizer':opt.state_dict()},out/'checkpoint.pt'); print(json.dumps(report),flush=True)
+
+if __name__=='__main__': main()
