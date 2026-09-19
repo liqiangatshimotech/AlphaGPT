@@ -9,7 +9,7 @@ must use that mask before calculating features or placing orders.
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -123,6 +123,8 @@ def resample_ohlcv(
         raise ValueError("time column contains invalid timestamps") from exc
     if frame[time_col].isna().any():
         raise ValueError("time column contains null timestamps")
+    if not frame[time_col].equals(frame[time_col].dt.floor(source)):
+        raise ValueError("source timestamps must align to source_interval")
 
     # Keep only fields that actually exist.  Missing optional fields should not
     # be manufactured as zeros: a caller can then distinguish unavailable
@@ -139,6 +141,8 @@ def resample_ohlcv(
         group_name = group_col
         # Null addresses are not useful for joins or model tensors.
         frame = frame[frame[group_col].notna()].copy()
+    if frame.duplicated([group_name, time_col]).any():
+        raise ValueError("duplicate source timestamp within an address")
 
     output_columns = ([time_col] + ([group_col] if has_group else []) + value_columns +
                       ["observed", "complete", "source_count", "valid_count"])
@@ -146,8 +150,7 @@ def resample_ohlcv(
         return pd.DataFrame(columns=output_columns)
 
     records: list[dict] = []
-    # Stable sort makes first/last deterministic if a source has duplicate
-    # timestamps.  Duplicate timestamps count once toward completeness.
+    # Stable sort makes first/last deterministic for input in arbitrary order.
     frame = frame.sort_values([group_name, "__bucket", time_col], kind="mergesort")
     for group_value, grouped in frame.groupby(group_name, sort=False, dropna=False):
         buckets = grouped["__bucket"]
@@ -159,8 +162,7 @@ def resample_ohlcv(
         for bucket in bucket_values:
             part = grouped[grouped["__bucket"] == bucket]
             valid = part[part["__valid"]]
-            # Keep unique source timestamps for the completeness check.  A
-            # duplicated source row must not make a partial bucket complete.
+            # Exact alignment and uniqueness have been checked above.
             valid_times = valid[time_col].dt.floor(source).drop_duplicates()
             valid_count = int(len(valid_times))
             source_count = int(part[time_col].dt.floor(source).drop_duplicates().size)

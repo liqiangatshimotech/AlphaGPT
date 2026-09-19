@@ -1,6 +1,5 @@
 import unittest
 
-import numpy as np
 import pandas as pd
 
 from model_core.resampling import aggregate_ohlcv, resample_ohlcv
@@ -88,6 +87,14 @@ class ResamplingTests(unittest.TestCase):
             resample_ohlcv(_rows().drop(columns=["high"]), "3min")
         with self.assertRaises(ValueError):
             resample_ohlcv(_rows(), "0min")
+
+    def test_duplicate_and_unaligned_source_timestamps_fail(self):
+        frame = _rows()
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            resample_ohlcv(pd.concat([frame, frame.iloc[[0]]]), "3min")
+        frame.loc[0, "time"] += pd.Timedelta(seconds=10)
+        with self.assertRaisesRegex(ValueError, "align"):
+            resample_ohlcv(frame, "3min")
 
 
 if __name__ == "__main__":
