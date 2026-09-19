@@ -3,6 +3,7 @@ import torch
 from model_core.research_train import legal_mask, causal_features, metrics
 from model_core.vocab import load_formula, FORMULA_VOCAB as V
 from model_core.ops import OPS_CONFIG
+from model_core.genetic_search import random_formula, mutate, crossover
 
 class ResearchTests(unittest.TestCase):
     def test_generated_formulas(self):
@@ -27,6 +28,13 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(float(x[:,:,:10].abs().sum()),0.0)
         self.assertEqual(float(x[:,:,10:12].abs().sum()),0.0)
         self.assertGreater(float(x[:,:,30:].abs().sum()),0.0)
+    def test_genetic_formulas(self):
+        import random
+        rng=random.Random(3); parents=[random_formula(rng) for _ in range(30)]
+        for seq in parents:
+            self.assertNotIn(V.token_names.index("JUMP"), seq)
+            load_formula(list(mutate(seq,rng))); load_formula(list(crossover(seq,rng.choice(parents),rng)))
+
     def test_costs_and_purge(self):
         raw={'liquidity':torch.full((1,10),1e6),'tradable':torch.ones(1,10,dtype=torch.bool)}
         t=torch.zeros(1,10); t[:,-2:]=100

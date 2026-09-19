@@ -19,6 +19,7 @@ from .vm import StackVM
 
 
 ARITY = [0] * V.feature_count + [x[2] for x in OPS_CONFIG]
+JUMP_TOKEN = V.token_names.index('JUMP')
 OPS_BY_ARITY = {a: [V.feature_count + i for i, x in enumerate(OPS_CONFIG) if x[2] == a and x[0] != 'JUMP'] for a in (1, 2, 3)}
 
 
@@ -29,7 +30,7 @@ def random_formula(rng, max_len=12):
         for pos in range(max_len):
             remaining = max_len - pos - 1
             choices = [t for t, a in enumerate(ARITY)
-                       if depth >= a and 1 <= depth + 1 - a <= 1 + 2 * remaining]
+                       if t != JUMP_TOKEN and depth >= a and 1 <= depth + 1 - a <= 1 + 2 * remaining]
             if not choices:
                 break
             t = rng.choice(choices)
@@ -122,6 +123,9 @@ def percentile_threshold(factor, start, end, q=0.80):
 
 def score_formula(seq, vm, feat, raw, target, windows, cache):
     if seq in cache:
+        return cache[seq]
+    if JUMP_TOKEN in seq:
+        cache[seq] = (-10.0, {})
         return cache[seq]
     factor = vm.execute(seq, feat)
     if factor is None or not torch.isfinite(factor).all():
