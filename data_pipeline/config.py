@@ -24,8 +24,25 @@ class Config:
     ).strip().lower() in {"1", "true", "yes"}
     BASE_URL = BIRDEYE_BASE_URL
     BIRDEYE_IS_PAID = True
+    BIRDEYE_TRENDING_LIMIT = min(
+        max(int(os.getenv("BIRDEYE_TRENDING_LIMIT", "50")), 1), 50
+    )
     USE_DEXSCREENER = False
-    CONCURRENCY = 20
+    # Dexscreener is a fail-closed data-quality gate when enabled.  Keep the
+    # thresholds configurable because they depend on the chain and fee model.
+    DEX_RULES_ENABLED = os.getenv("DEX_RULES_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+    DEX_MIN_LIQUIDITY_USD = float(os.getenv("DEX_MIN_LIQUIDITY_USD", "500000"))
+    DEX_MIN_VOLUME_5M_USD = float(os.getenv("DEX_MIN_VOLUME_5M_USD", "10000"))
+    DEX_MIN_TXNS_5M = int(os.getenv("DEX_MIN_TXNS_5M", "10"))
+    CONCURRENCY = min(
+        max(int(os.getenv("BIRDEYE_CONCURRENCY", "1")), 1), 20
+    )
+    BIRDEYE_MAX_RETRIES = min(
+        max(int(os.getenv("BIRDEYE_MAX_RETRIES", "5")), 0), 10
+    )
+    BIRDEYE_MIN_INTERVAL_SECONDS = max(
+        float(os.getenv("BIRDEYE_MIN_INTERVAL_SECONDS", "1.1")), 0.0
+    )
     HISTORY_DAYS = 7
 
     @classmethod

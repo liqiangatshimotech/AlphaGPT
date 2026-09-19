@@ -12,7 +12,7 @@ class DataManager:
         self.db = DBManager()
         self.birdeye = BirdeyeProvider()
         self.dexscreener = DexScreenerProvider()
-        
+
     async def initialize(self):
         await self.db.connect()
         await self.db.init_schema()
@@ -24,26 +24,44 @@ class DataManager:
         logger.info("Step 1: Discovering trending tokens...")
         limit = Config.BIRDEYE_TRENDING_LIMIT
         candidates = await self.birdeye.get_trending_tokens(limit=limit)
-        
+
         logger.info(f"Raw candidates found: {len(candidates)}")
 
         selected_tokens = []
         for t in candidates:
             liq = t.get('liquidity', 0)
             fdv = t.get('fdv', 0)
-            
+
             if liq < Config.MIN_LIQUIDITY_USD: continue
             if fdv < Config.MIN_FDV: continue
             if fdv > Config.MAX_FDV: continue # 剔除像 WIF/BONK 这种巨无霸，专注于早期高成长
-            
+
             selected_tokens.append(t)
-            
+
         logger.info(f"Tokens selected after filtering: {len(selected_tokens)}")
+        dex_details = []
+        if Config.DEX_RULES_ENABLED and selected_tokens:
+            # Apply the independent pool-quality gate before writing OHLCV.
+            # Use a credential-free session for Dexscreener.
+            async with aiohttp.ClientSession() as dex_session:
+                dex_details = await self.dexscreener.get_token_details_batch(
+                    dex_session, [t['address'] for t in selected_tokens]
+                )
+            by_address = {item['address']: item for item in dex_details}
+            before = len(selected_tokens)
+            selected_tokens = [
+                token for token in selected_tokens
+                if (item := by_address.get(token['address']))
+                and item['liquidity'] >= Config.DEX_MIN_LIQUIDITY_USD
+                and item.get('volume_5m', 0.0) >= Config.DEX_MIN_VOLUME_5M_USD
+                and item.get('txns_5m_buys', 0) + item.get('txns_5m_sells', 0) >= Config.DEX_MIN_TXNS_5M
+            ]
+            logger.info(f"Dexscreener rules kept {len(selected_tokens)}/{before} tokens")
         latest = await self.db.get_latest_candles()
         if include_existing:
             selected_addresses = {t['address'] for t in selected_tokens}
             selected_tokens.extend(t for addr, t in latest.items() if addr not in selected_addresses)
-        
+
         if not selected_tokens:
             logger.warning("No tokens passed the filter. Relax constraints in Config.")
             return
@@ -52,7 +70,7 @@ class DataManager:
         await self.db.upsert_tokens(db_tokens)
 
         logger.info(f"Incremental OHLCV sync for {len(selected_tokens)} tokens...")
-        
+
         end_time = int(time.time()) // 60 * 60
         total_candles = 0
         async with aiohttp.ClientSession(headers=self.birdeye.headers) as session:
@@ -84,10 +102,12 @@ class DataManager:
             try:
                 # Use a separate session: Birdeye's API key header must never
                 # be sent to the independent Dexscreener host.
-                async with aiohttp.ClientSession() as snapshot_session:
-                    details = await self.dexscreener.get_token_details_batch(
-                        snapshot_session, [t['address'] for t in selected_tokens]
-                    )
+                details = dex_details
+                if not details:
+                    async with aiohttp.ClientSession() as snapshot_session:
+                        details = await self.dexscreener.get_token_details_batch(
+                            snapshot_session, [t['address'] for t in selected_tokens]
+                        )
                 snapshots.extend([
                     (snapshot_time, item['address'], item.get('liquidity'),
                      item.get('fdv'), 'dexscreener')

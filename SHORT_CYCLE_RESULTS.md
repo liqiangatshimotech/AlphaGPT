@@ -36,6 +36,8 @@
 
 已启动独立快照采集器 `python -m data_pipeline.run_liquidity_snapshots` 做现场验证。当前累计 420 条 Birdeye trending 快照、9 个不同时间点、55 个 token；其中只有 17 个 token 在采集窗口内出现超过 1% 的流动性变化。Dexscreener 网络不可达时不会阻断 Birdeye 记录。这个约 16 分钟的时间跨度仍太短，尚未用于训练或回测。
 
+Dexscreener 恢复后已启用入库前规则：`liquidity >= $500,000`、5 分钟成交额 `>= $10,000`、5 分钟买卖笔数合计 `>= 10`。最近一次同步中 Birdeye 初筛得到 21 个 token，Dexscreener 最终保留 3 个并写入 OHLCV；这证明规则已经位于数据采集入口，而不是只作用于快照。
+
 下一步应先解决数据和执行条件：
 
 1. 用真实 API 返回的 3m/5m 完整 OHLCV，而不是从稀疏历史点抽样。
