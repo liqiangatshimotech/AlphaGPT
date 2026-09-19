@@ -34,6 +34,8 @@
 
 同步流程新增独立的 `liquidity_snapshots` 表，按 `(time,address,source)` 保存 Dexscreener 的点时观察；该表不会回写 OHLCV。快照覆盖率达到研究要求前，模型仍不能把历史流动性当作可成交深度。
 
+已启动独立快照采集器 `python -m data_pipeline.run_liquidity_snapshots` 做现场验证。当前累计 170 条 Birdeye trending 快照、4 个不同时间点；Dexscreener 网络不可达时不会阻断 Birdeye 记录。这个时间跨度仍太短，尚未用于训练或回测。
+
 下一步应先解决数据和执行条件：
 
 1. 用真实 API 返回的 3m/5m 完整 OHLCV，而不是从稀疏历史点抽样。
