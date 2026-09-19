@@ -45,16 +45,34 @@ def causal_features(raw):
                 torch.tanh((c-raw['open'])/(raw['high']-raw['low']+1e-9)*3),
                 fomo, (c-ma)/(ma+1e-9), torch.log1p(v)]
     out=[]
-    valid=raw['observed']; count=valid.cumsum(1).clamp_min(1)
+    valid=raw['observed']
+
+    def running_z(x, mask):
+        """Online per-contiguous-run z score; never imports later bars."""
+        count = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        mean = torch.zeros_like(x[:, 0]); m2 = torch.zeros_like(x[:, 0])
+        values = []
+        for t in range(x.shape[1]):
+            ok = mask[:, t]
+            count = torch.where(ok, count + 1, torch.zeros_like(count))
+            old_mean = mean
+            xt = torch.where(ok, x[:, t], torch.zeros_like(x[:, t]))
+            delta = xt - old_mean
+            mean = torch.where(ok, old_mean + delta / count.clamp_min(1).float(), torch.zeros_like(old_mean))
+            delta2 = xt - mean
+            m2 = torch.where(ok, m2 + delta * delta2, torch.zeros_like(m2))
+            std = torch.sqrt((m2 / count.clamp_min(1).float()).clamp_min(0) + 1e-6)
+            values.append(torch.where(ok, ((xt - mean) / std).clamp(-5, 5), torch.zeros_like(xt)))
+        return torch.stack(values, dim=1)
+
+    warm = valid & (run >= 20)
     for i,x in enumerate(channels):
         x=torch.where(valid,x,0)
         if i in (0,3,4,5):
-            mean=x.cumsum(1)/count
-            var=(x.square().cumsum(1)/count-mean.square()).clamp_min(0)
-            x=((x-mean)/(var.sqrt()+1e-6)).clamp(-5,5)
+            x=running_z(x, warm)
         # Keep a conservative warm-up mask for every feature.  This prevents
         # one-bar listing artifacts from becoming tradable formulas.
-        out.append(torch.where(valid & (run >= 20),x,0))
+        out.append(torch.where(warm,x,0))
     return torch.stack(out,1)
 
 
