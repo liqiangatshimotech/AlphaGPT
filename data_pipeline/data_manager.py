@@ -71,6 +71,16 @@ class DataManager:
             # Store current pool observations separately.  These values are
             # valid at snapshot time only; they are intentionally not copied
             # onto the historical OHLCV rows.
+            snapshot_time = datetime.fromtimestamp(end_time)
+            # Birdeye trending already provided a current pool snapshot;
+            # persist it even when the optional Dexscreener supplement is
+            # unreachable. This is point-in-time data only.
+            snapshots = [
+                (snapshot_time, item['address'], item.get('liquidity'),
+                 item.get('fdv'), 'birdeye_trending')
+                for item in selected_tokens
+                if item.get('address') and item.get('liquidity') is not None
+            ]
             try:
                 # Use a separate session: Birdeye's API key header must never
                 # be sent to the independent Dexscreener host.
@@ -78,20 +88,19 @@ class DataManager:
                     details = await self.dexscreener.get_token_details_batch(
                         snapshot_session, [t['address'] for t in selected_tokens]
                     )
-                snapshot_time = datetime.fromtimestamp(end_time)
-                snapshots = [
+                snapshots.extend([
                     (snapshot_time, item['address'], item.get('liquidity'),
                      item.get('fdv'), 'dexscreener')
                     for item in details
                     if item.get('address') and item.get('liquidity') is not None
-                ]
-                inserted_snapshots = await self.db.batch_insert_liquidity_snapshots(snapshots)
-                logger.info(f"Liquidity snapshots stored: {inserted_snapshots}")
+                ])
             except Exception as exc:
                 # OHLCV collection remains usable when the optional snapshot
                 # provider is unavailable; the missing depth is visible in
                 # the separate table and never silently backfilled.
                 logger.warning(f"Liquidity snapshot collection unavailable: {type(exc).__name__}")
+            inserted_snapshots = await self.db.batch_insert_liquidity_snapshots(snapshots)
+            logger.info(f"Liquidity snapshots stored: {inserted_snapshots}")
         logger.success(f"Pipeline complete. New candles stored: {total_candles}")
         return {'inserted': total_candles, 'tokens': len(selected_tokens),
                 'end_time': end_time, 'liquidity_snapshots': inserted_snapshots if 'inserted_snapshots' in locals() else 0}
