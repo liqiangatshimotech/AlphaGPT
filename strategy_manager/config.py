@@ -1,6 +1,6 @@
 class StrategyConfig:
-    MAX_OPEN_POSITIONS = 3
-    ENTRY_AMOUNT_SOL = 2.0
+    MAX_OPEN_POSITIONS = 1
+    ENTRY_AMOUNT_SOL = 7.0
     STOP_LOSS_PCT = -0.05
     TAKE_PROFIT_Target1 = 0.10
     TP_Target1_Ratio = 0.5
