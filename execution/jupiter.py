@@ -1,12 +1,17 @@
 import aiohttp
 import base64
+from dotenv import load_dotenv
 from loguru import logger
 from solders.transaction import VersionedTransaction
 from .config import ExecutionConfig
 
 class JupiterAggregator:
     def __init__(self):
-        self.base_url = "https://quote-api.jup.ag/v6"
+        load_dotenv()
+        self.base_url = ExecutionConfig.JUPITER_BASE_URL
+        self.headers = {"accept": "application/json"}
+        if ExecutionConfig.JUPITER_API_KEY:
+            self.headers["x-api-key"] = ExecutionConfig.JUPITER_API_KEY
         self.session = None
 
     async def _get_session(self):
@@ -26,10 +31,10 @@ class JupiterAggregator:
             "onlyDirectRoutes": "false",
             "asLegacyTransaction": "false"
         }
-        async with session.get(url, params=params) as resp:
+        async with session.get(url, params=params, headers=self.headers) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                logger.error(f"Jupiter Quote Error: {text}")
+                logger.error(f"Jupiter Quote Error {resp.status}: {text}")
                 return None
             return await resp.json()
 
@@ -43,10 +48,10 @@ class JupiterAggregator:
             "computeUnitPriceMicroLamports": "auto",
             "prioritizationFeeLamports": "auto"
         }
-        async with session.post(url, json=payload) as resp:
+        async with session.post(url, json=payload, headers=self.headers) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                logger.error(f"Jupiter Swap API Error: {text}")
+                logger.error(f"Jupiter Swap API Error {resp.status}: {text}")
                 return None
             data = await resp.json()
             return data.get("swapTransaction")

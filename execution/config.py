@@ -11,6 +11,11 @@ class ExecutionConfig:
     _PAYER_KEYPAIR = None
 
     DEFAULT_SLIPPAGE_BPS = 200 # bps
+
+    # Jupiter Swap API v1. The old quote-api.jup.ag/v6 endpoint is no longer
+    # the configured production route and may fail TLS/DNS from this host.
+    JUPITER_BASE_URL = os.getenv("JUPITER_BASE_URL", "https://api.jup.ag/swap/v1").rstrip("/")
+    JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
     
     PRIORITY_LEVEL = "High" 
     

@@ -9,6 +9,7 @@ class BirdeyeProvider(DataProvider):
     def __init__(self):
         self.base_url = Config.BIRDEYE_BASE_URL
         self.headers = Config.birdeye_headers()
+        self.headers["x-chain"] = Config.CHAIN
         self.semaphore = asyncio.Semaphore(Config.CONCURRENCY)
 
     @staticmethod
@@ -20,7 +21,8 @@ class BirdeyeProvider(DataProvider):
         except (TypeError, ValueError):
             return default
         
-    async def get_trending_tokens(self, limit=100):
+    async def get_trending_tokens(self, limit=50):
+        limit = min(max(int(limit), 1), 50)
         url = f"{self.base_url}/defi/token_trending"
         params = {
             "sort_by": "rank",
@@ -48,7 +50,8 @@ class BirdeyeProvider(DataProvider):
                             })
                         return results
                     else:
-                        logger.error(f"Birdeye Trending Error: {resp.status}")
+                        body = await resp.text()
+                        logger.error(f"Birdeye Trending Error {resp.status}: {body[:500]}")
                         return []
             except Exception as e:
                 logger.error(f"Birdeye Trending Exception: {e}")
