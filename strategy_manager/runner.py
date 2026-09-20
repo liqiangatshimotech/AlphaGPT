@@ -36,6 +36,11 @@ class StrategyRunner:
                 if isinstance(data, list) or "vocab_version" not in data:
                     logger.warning("Unversioned formula loaded with original VM token semantics.")
             logger.success(f"Loaded Strategy: {self.formula}")
+            logger.info(
+                f"Live sizing: max_positions={StrategyConfig.MAX_OPEN_POSITIONS}, "
+                f"entry_amount_sol={StrategyConfig.ENTRY_AMOUNT_SOL:.4f}, "
+                f"buy_threshold={StrategyConfig.BUY_THRESHOLD:.3f}"
+            )
         except FileNotFoundError:
             logger.critical("Strategy file not found! Please train model first.")
             exit(1)
