@@ -56,3 +56,16 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Wallet state and local operational controls (never deploy from Git)
+/portfolio_state.json
+/portfolio_state.json.*.tmp
+/pending_orders.json
+/pending_orders.json.*.tmp
+/pending_orders.json.history.jsonl
+/pending_recovery.json
+/STOP_SIGNAL
+
+# Locally trained strategy and training output
+/best_meme_strategy.json
+/training_history.json

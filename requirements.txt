@@ -32,8 +32,8 @@ tqdm>=4.66.0          # Progress bars
 
 # Solana Blockchain Integration
 # Note: Install solders first, then solana (as recommended by solana-py)
-solders>=0.18.0       # Solana Rust bindings (install first)
-solana>=0.30.0        # Solana Python SDK
+solders>=0.27.1,<0.28 # Validated transaction/RPC response types
+solana>=0.38.0,<0.39  # Uses solana.rpc.models and current confirmation APIs
 base58>=2.1.0         # Base58 encoding for Solana addresses
 
 # Dashboard & Visualization

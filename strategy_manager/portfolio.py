@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from dataclasses import dataclass, asdict
 from typing import Dict
@@ -59,8 +60,12 @@ class PortfolioManager:
 
     def save_state(self):
         data = {k: asdict(v) for k, v in self.positions.items()}
-        with open(self.state_file, 'w') as f:
+        tmp_path = f"{self.state_file}.{os.getpid()}.tmp"
+        with open(tmp_path, 'w') as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.state_file)
 
     def load_state(self):
         try:

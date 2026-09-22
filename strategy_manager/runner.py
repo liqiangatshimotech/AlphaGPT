@@ -10,6 +10,7 @@ from model_core.vm import StackVM
 from model_core.data_loader import CryptoDataLoader
 from model_core.vocab import load_formula
 from execution.trader import SolanaTrader
+from execution.rpc_handler import TransactionStatusUnknown
 from execution.utils import get_mint_decimals
 from .config import StrategyConfig
 from .portfolio import PortfolioManager
@@ -22,12 +23,16 @@ class StrategyRunner:
         self.risk = RiskEngine()
         self.trader = SolanaTrader()
         self.vm = StackVM()
-        
+
         self.loader = CryptoDataLoader()
         self.token_map = {} # {address: tensor_index} 用于快速查找特征
         self.last_scan_time = 0
         self.entries_paused = False
+        self.entry_cooldowns = {}
         self.stop_signal_path = os.getenv("STOP_SIGNAL_PATH", "STOP_SIGNAL")
+        self.pending_orders_path = os.getenv("PENDING_ORDERS_PATH", "pending_orders.json")
+        self.order_history_path = os.getenv("ORDER_HISTORY_PATH", "logs/order_recovery.jsonl")
+        self.pending_orders = self._load_pending_orders()
         
         try:
             with open("best_meme_strategy.json", "r") as f:
@@ -46,9 +51,16 @@ class StrategyRunner:
             exit(1)
 
     async def initialize(self):
+        # Reconcile and monitor persisted positions before the data pipeline
+        # warms up.  This keeps exits available during a launchd handover.
+        await self._reconcile_pending_orders()
+        await self.monitor_positions()
         await self.data_mgr.initialize()
         bal = await self.trader.rpc.get_balance()
-        logger.info(f"Bot Initialized. Wallet Balance: {bal:.4f} SOL")
+        if bal is None:
+            logger.warning("Bot Initialized, but wallet balance is currently unavailable.")
+        else:
+            logger.info(f"Bot Initialized. Wallet Balance: {bal:.4f} SOL")
 
     async def run_loop(self):
         logger.info(">_< | Strategy Runner Started (Live Mode)")
@@ -71,10 +83,12 @@ class StrategyRunner:
                 except Exception:
                     self.token_map = {}
                     logger.exception("Data refresh failed; monitoring positions without AI signals.")
+                    await self._reconcile_pending_orders()
                     await self.monitor_positions()
                     await asyncio.sleep(30)
                     continue
 
+                await self._reconcile_pending_orders()
                 await self.monitor_positions()
 
                 if self._handle_stop_signal():
@@ -117,6 +131,173 @@ class StrategyRunner:
         self.token_map = {addr: idx for idx, addr in enumerate(self.loader.addresses)}
         logger.info(f"Mapped {len(self.token_map)} tokens for inference.")
 
+    def _load_pending_orders(self):
+        try:
+            with open(self.pending_orders_path, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Pending journal must be an object")
+        except FileNotFoundError:
+            return {}
+        # Malformed journals must not be treated as no outstanding orders.
+        # This file is only read at startup; current service stays running
+        # throughout deployment validation.
+        recovery_path = os.getenv("LEGACY_PENDING_RECOVERY_PATH", "pending_recovery.json")
+        try:
+            with open(recovery_path) as f:
+                recoveries = json.load(f)
+        except FileNotFoundError:
+            recoveries = {}
+        for token, order in data.items():
+            recovery = recoveries.get(token, {})
+            if (recovery.get("signature") == order.get("signature")
+                    and recovery.get("kind") == "audited_legacy_jupiter_v1"
+                    and not order.get("recent_blockhash")
+                    and not order.get("last_valid_block_height")):
+                # This is an audited, conservative upper bound for this one
+                # legacy ordinary swap, NOT its original blockhash expiry.
+                order.update({k: recovery[k] for k in (
+                    "last_valid_block_height", "pre_raw_balance", "amount_raw",
+                    "decimals", "recovery_evidence",
+                )})
+        return data
+
+    def _save_pending_orders(self):
+        tmp_path = f"{self.pending_orders_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(self.pending_orders, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.pending_orders_path)
+
+    def _archive_order(self, token_addr, order, outcome, evidence):
+        path = getattr(self, "order_history_path", self.pending_orders_path + ".history.jsonl")
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        record = {**order, "token_address": token_addr, "outcome": outcome,
+                  "resolved_at": time.time(), "evidence": evidence}
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _resolve_pending(self, token_addr, order, outcome, evidence):
+        self._archive_order(token_addr, order, outcome, evidence)
+        self.pending_orders.pop(token_addr, None)
+        try:
+            self._save_pending_orders()
+        except Exception:
+            self.pending_orders[token_addr] = order
+            raise
+        logger.info(f"Pending {order['side']} resolved: {token_addr} | {outcome}")
+
+    def _record_pending_order(self, token_addr, signature, amount_sol, expected_out, score, metadata=None):
+        self.pending_orders[token_addr] = {
+            "side": "buy", "token_address": token_addr,
+            "signature": str(signature), "amount_sol": float(amount_sol),
+            "expected_out": int(expected_out), "score": float(score),
+            "created_at": time.time(), **(metadata or {}),
+        }
+        self._save_pending_orders()
+        logger.info(f"BUY journaled before submission: {token_addr} | {signature}")
+
+    def _record_pending_sell(self, token_addr, signature, ratio, reason, metadata=None):
+        self.pending_orders[token_addr] = {
+            "side": "sell", "token_address": token_addr,
+            "signature": str(signature), "ratio": float(ratio), "reason": reason,
+            "created_at": time.time(), **(metadata or {}),
+        }
+        self._save_pending_orders()
+        logger.info(f"SELL journaled before submission: {token_addr} | {signature}")
+
+    async def _finalize_pending_order(self, token_addr, order):
+        raw = await self.trader.rpc.get_token_balance(token_addr, commitment="confirmed")
+        before = order.get("pre_raw_balance")
+        decimals = order.get("decimals")
+        if raw is None or before is None or decimals is None or raw <= before:
+            return False
+        amount = raw / (10 ** int(decimals))
+        if token_addr not in self.portfolio.positions:
+            cost = float(order["amount_sol"])
+            self.portfolio.add_position(token_addr, f"Meme_{token_addr[:4]}",
+                                        cost / amount, amount, cost)
+        else:
+            self.portfolio.update_holding(token_addr, amount)
+        self._resolve_pending(token_addr, order, "confirmed", {"raw_balance": raw})
+        return True
+
+    async def _finalize_pending_sell(self, token_addr, order):
+        # Set the actual balance, never subtract the percentage again after
+        # restart.  Persist the take-profit flag in the same portfolio write.
+        raw = await self.trader.rpc.get_token_balance(token_addr, commitment="confirmed")
+        before, amount = order.get("pre_raw_balance"), order.get("amount_raw")
+        decimals = order.get("decimals")
+        if (raw is None or before is None or amount is None or decimals is None
+                or raw > int(before) - int(amount)):
+            return False
+        pos = self.portfolio.positions.get(token_addr)
+        if pos is not None:
+            if raw == 0:
+                self.portfolio.close_position(token_addr)
+            else:
+                pos.amount_held = raw / (10 ** int(decimals))
+                if order.get("reason") == "Moonbag":
+                    pos.is_moonbag = True
+                self.portfolio.save_state()
+        self._resolve_pending(token_addr, order, "confirmed", {"raw_balance": raw})
+        return True
+
+    async def _reconcile_pending_orders(self, token_addr=None):
+        if token_addr is None:
+            # Limit the entire recovery pass so an unhealthy RPC cannot
+            # indefinitely delay monitoring of other positions.
+            deadline = asyncio.get_running_loop().time() + 8.0
+            for token in list(self.pending_orders):
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._reconcile_pending_orders(token), remaining)
+                except asyncio.TimeoutError:
+                    logger.warning("Pending recovery budget exhausted; continuing position monitoring.")
+                    break
+            return
+        for token, order in list(self.pending_orders.items()):
+            if token_addr is not None and token != token_addr:
+                continue
+            try:
+                signature = order.get("signature")
+                if not signature:
+                    logger.error(f"Pending order missing signature; retained: {token}")
+                    continue
+                state, evidence = await self.trader.rpc.get_expiry_evidence(
+                    signature, recent_blockhash=order.get("recent_blockhash"),
+                    last_valid_block_height=order.get("last_valid_block_height"),
+                )
+                if state == "confirmed":
+                    if order.get("side") == "sell":
+                        await self._finalize_pending_sell(token, order)
+                    else:
+                        await self._finalize_pending_order(token, order)
+                elif state in {"failed", "expired"}:
+                    raw = await self.trader.rpc.get_token_balance(
+                        token, commitment="finalized",
+                        min_context_slot=(evidence or {}).get("expiry_slot"),
+                    )
+                    # Clear only after definitive failure/expiry AND an
+                    # unchanged finalized balance.  RPC errors are not zero.
+                    before = order.get("pre_raw_balance")
+                    if raw is not None and before is not None and raw == int(before):
+                        self._resolve_pending(token, order, state,
+                                              {**(evidence or {}), "raw_balance": raw})
+                        logger.warning(f"Exit/entry unblocked after {state}: {token}; re-evaluate live strategy.")
+                    else:
+                        logger.warning(f"Pending {state} but balance needs reconciliation: {token}")
+                else:
+                    logger.info(f"Pending status {state}; retained: {token}")
+            except Exception as exc:
+                # One unavailable token must not stop exits for other tokens.
+                logger.warning(f"Pending reconciliation deferred: {token} ({type(exc).__name__})")
+
     async def monitor_positions(self):
         if not self.portfolio.positions: return
 
@@ -129,12 +310,15 @@ class StrategyRunner:
                 continue
 
             self.portfolio.update_price(token_addr, current_price)
-            
+
             pnl_pct = (current_price - pos.entry_price) / pos.entry_price
             
             if pnl_pct <= StrategyConfig.STOP_LOSS_PCT:
                 logger.warning(f"!!! | STOP LOSS: {pos.symbol} PnL: {pnl_pct:.2%}")
                 await self._execute_sell(token_addr, 1.0, "StopLoss")
+                self.entry_cooldowns[token_addr] = (
+                    time.time() + StrategyConfig.STOP_LOSS_COOLDOWN_SECONDS
+                )
                 continue
 
             if not pos.is_moonbag and pnl_pct >= StrategyConfig.TAKE_PROFIT_Target1:
@@ -185,9 +369,16 @@ class StrategyRunner:
                 
             token_addr = idx_to_addr.get(idx)
             if not token_addr: continue
+
+            cooldown_until = self.entry_cooldowns.get(token_addr)
+            if cooldown_until is not None:
+                if time.time() < cooldown_until:
+                    continue
+                self.entry_cooldowns.pop(token_addr, None)
             
             # 过滤已持仓
-            if token_addr in self.portfolio.positions: continue
+            if token_addr in self.portfolio.positions or token_addr in self.pending_orders:
+                continue
             
             # 从 loader 缓存获取该 Token 的最新流动性
             # raw_data_cache['liquidity']: [Tokens, Time]
@@ -199,23 +390,36 @@ class StrategyRunner:
             if is_safe:
                 if self._handle_stop_signal():
                     return
-                await self._execute_buy(token_addr, score)
+                buy_success = await self._execute_buy(token_addr, score)
                 
                 # 检查仓位上限
                 if self.portfolio.get_open_count() >= StrategyConfig.MAX_OPEN_POSITIONS:
                     break
+                # A failed live order usually indicates a quote/API/RPC issue.
+                # Stop this scan and retry from a fresh market snapshot next
+                # cycle instead of hammering the execution API with every
+                # remaining candidate.
+                if not buy_success:
+                    return
 
     async def _execute_buy(self, token_addr, score):
         if self._handle_stop_signal():
             logger.warning("Buy skipped because STOP signal is active.")
-            return
+            return False
+
+        if token_addr in self.pending_orders:
+            logger.warning(f"Buy skipped; token already has a pending transaction: {token_addr}")
+            return False
 
         balance = await self.trader.rpc.get_balance()
+        if balance is None:
+            logger.warning("Entry deferred because wallet balance is unavailable from RPC.")
+            return False
         amount_sol = self.risk.calculate_position_size(balance)
         
         if amount_sol <= 0:
             logger.warning("Insufficient balance for new entry.")
-            return
+            return False
 
         logger.info(f"🎉 | EXECUTING BUY: {token_addr} | Amt: {amount_sol} SOL")
         
@@ -228,54 +432,47 @@ class StrategyRunner:
         
         if not quote:
             logger.error("Failed to get quote for buy.")
-            return
+            return False
 
         if self._handle_stop_signal():
             logger.warning("Buy cancelled because STOP signal became active.")
-            return
+            return False
 
-        tx_signature = await self.trader.buy(
-            token_addr, amount_sol, should_cancel=self._handle_stop_signal
-        )
-        
-        if tx_signature: # Assuming buy returns Sig or True
-            # 更新 Portfolio
-            # 由于链上查询余额有延迟，我们先用 Quote 的预估值 (outAmount) 记账
-            # 为了防止连续重复下单
-            expected_out = int(quote['outAmount'])
-            
-            decimals = await get_mint_decimals(token_addr, self.trader.rpc.client)
-            token_amount_ui = expected_out / (10 ** decimals)
-            
-            entry_price_sol = amount_sol / token_amount_ui if token_amount_ui > 0 else 0
-            
-            self.portfolio.add_position(
-                token=token_addr,
-                symbol=f"Meme_{token_addr[:4]}", # 暂时用简写，后续可查 Metadata
-                price=entry_price_sol,
-                amount=token_amount_ui,
-                cost_sol=amount_sol
+        def record(metadata):
+            self._record_pending_order(
+                token_addr, metadata["signature"], amount_sol,
+                quote["outAmount"], score, metadata,
             )
-            logger.success(f"+ | Position Added: {token_amount_ui:.2f} units @ {entry_price_sol:.6f} SOL")
+        try:
+            success = await self.trader.buy(
+                token_addr, amount_sol, should_cancel=self._handle_stop_signal,
+                quote_response=quote, on_submitting=record,
+            )
+        except TransactionStatusUnknown as exc:
+            logger.warning(f"BUY still pending: {token_addr} | {exc.signature}")
+            return False
+        await self._reconcile_pending_orders(token_addr)
+        return bool(success and token_addr not in self.pending_orders
+                    and token_addr in self.portfolio.positions)
 
     async def _execute_sell(self, token_addr, ratio, reason):
         pos = self.portfolio.positions.get(token_addr)
-        if not pos: return
-
+        if pos is None:
+            return False
+        if token_addr in self.pending_orders:
+            logger.warning(f"Sell skipped; token already has a pending transaction: {token_addr}")
+            return False
         logger.info(f"- | EXECUTING SELL: {token_addr} | Ratio: {ratio:.0%} | Reason: {reason}")
-        
-        success = await self.trader.sell(token_addr, percentage=ratio)
-        
-        if success:
-            new_amount = pos.amount_held * (1.0 - ratio)
-            
-            if ratio > 0.98 or new_amount * pos.entry_price < 0.001:
-                self.portfolio.close_position(token_addr)
-            else:
-                self.portfolio.update_holding(token_addr, new_amount)
-                
-            logger.success(f"o.O | Trade Completed: {reason}")
-        return bool(success)
+
+        def record(metadata):
+            self._record_pending_sell(token_addr, metadata["signature"], ratio, reason, metadata)
+        try:
+            success = await self.trader.sell(token_addr, percentage=ratio, on_submitting=record)
+        except TransactionStatusUnknown as exc:
+            logger.warning(f"SELL still pending: {token_addr} | {exc.signature}")
+            return False
+        await self._reconcile_pending_orders(token_addr)
+        return bool(success and token_addr not in self.pending_orders)
 
     async def _run_inference(self, token_addr):
         idx = self.token_map.get(token_addr)

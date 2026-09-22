@@ -29,7 +29,9 @@ class RiskEngine:
 
     def calculate_position_size(self, wallet_balance_sol):
         size = self.config.ENTRY_AMOUNT_SOL
-        
+        if wallet_balance_sol is None:
+            return 0.0
+
         if wallet_balance_sol < size + 0.1:
             return 0.0
             
