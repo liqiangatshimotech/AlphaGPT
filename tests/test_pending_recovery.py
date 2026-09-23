@@ -94,6 +94,20 @@ class PendingRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.runner.portfolio.positions[TOKEN].amount_held, 100.0)
                 self.runner.trader.sell.assert_not_awaited()
 
+    async def test_pending_buy_reserves_last_slot_before_any_new_order(self):
+        for index in range(3):
+            self.runner.portfolio.add_position(
+                f"owned-{index}", f"OWNED-{index}", 1.0, 1.0, 1.0
+            )
+        self.runner.pending_orders["in-flight"] = {
+            "side": "buy", "signature": "pending-signature"
+        }
+        self.runner.trader.rpc.get_balance = AsyncMock(return_value=10.0)
+        self.assertEqual(self.runner._entry_slot_count(), 5)
+        self.assertFalse(await self.runner._execute_buy("candidate", 1.0))
+        self.runner.trader.rpc.get_balance.assert_not_awaited()
+        self.runner.trader.sell.assert_not_awaited()
+
     async def test_unknown_full_sell_does_not_treat_zero_balance_as_confirmation(self):
         self._pending_sell(ratio=1.0, reason="StopLoss", amount_raw=PRE_RAW_BALANCE)
         self.runner.trader.rpc.get_expiry_evidence.return_value = ("unknown", {"error": "timeout"})

@@ -93,7 +93,7 @@ class StrategyRunner:
 
                 if self._handle_stop_signal():
                     logger.warning("New entries paused; position monitoring remains active.")
-                elif self.portfolio.get_open_count() < StrategyConfig.MAX_OPEN_POSITIONS:
+                elif self._entry_slot_count() < StrategyConfig.MAX_OPEN_POSITIONS:
                     await self.scan_for_entries()
                 else:
                     logger.info("Max positions reached. Scanning skipped.")
@@ -130,6 +130,14 @@ class StrategyRunner:
     async def _build_token_mapping(self):
         self.token_map = {addr: idx for idx, addr in enumerate(self.loader.addresses)}
         logger.info(f"Mapped {len(self.token_map)} tokens for inference.")
+
+    def _entry_slot_count(self):
+        """Reserve a slot for each submitted buy until chain reconciliation."""
+        pending_buys = {
+            token for token, order in self.pending_orders.items()
+            if order.get("side") == "buy"
+        }
+        return len(set(self.portfolio.positions) | pending_buys)
 
     def _load_pending_orders(self):
         try:
@@ -347,6 +355,9 @@ class StrategyRunner:
         if self._handle_stop_signal():
             return
 
+        if self._entry_slot_count() >= StrategyConfig.MAX_OPEN_POSITIONS:
+            return
+
         raw_signals = self.vm.execute(self.formula, self.loader.feat_tensor)
         
         if raw_signals is None: return
@@ -362,6 +373,8 @@ class StrategyRunner:
         idx_to_addr = {v: k for k, v in self.token_map.items()}
         
         for idx in sorted_indices:
+            if self._entry_slot_count() >= StrategyConfig.MAX_OPEN_POSITIONS:
+                break
             score = float(scores[idx])
             
             if score < StrategyConfig.BUY_THRESHOLD:
@@ -393,7 +406,7 @@ class StrategyRunner:
                 buy_success = await self._execute_buy(token_addr, score)
                 
                 # 检查仓位上限
-                if self.portfolio.get_open_count() >= StrategyConfig.MAX_OPEN_POSITIONS:
+                if self._entry_slot_count() >= StrategyConfig.MAX_OPEN_POSITIONS:
                     break
                 # A failed live order usually indicates a quote/API/RPC issue.
                 # Stop this scan and retry from a fresh market snapshot next
@@ -405,6 +418,10 @@ class StrategyRunner:
     async def _execute_buy(self, token_addr, score):
         if self._handle_stop_signal():
             logger.warning("Buy skipped because STOP signal is active.")
+            return False
+
+        if self._entry_slot_count() >= StrategyConfig.MAX_OPEN_POSITIONS:
+            logger.warning("Buy skipped because existing and pending buys fill all position slots.")
             return False
 
         if token_addr in self.pending_orders:
