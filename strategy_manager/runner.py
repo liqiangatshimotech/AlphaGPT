@@ -35,6 +35,7 @@ class StrategyRunner:
         self.zero_balance_first_seen = {}
         self.zero_balance_last_alerted = {}
         self.failed_route_exclusions = {}
+        self.failed_route_candidates = {}
         self.stop_signal_path = os.getenv("STOP_SIGNAL_PATH", "STOP_SIGNAL")
         self.pending_orders_path = os.getenv("PENDING_ORDERS_PATH", "pending_orders.json")
         self.order_history_path = os.getenv("ORDER_HISTORY_PATH", "logs/order_recovery.jsonl")
@@ -250,6 +251,7 @@ class StrategyRunner:
             )
         if outcome == "confirmed" and order.get("side") == "sell":
             getattr(self, "failed_route_exclusions", {}).pop(token_addr, None)
+            getattr(self, "failed_route_candidates", {}).pop(token_addr, None)
         self.pending_orders.pop(token_addr, None)
         try:
             self._save_pending_orders()
@@ -313,7 +315,8 @@ class StrategyRunner:
         if token_addr not in self.portfolio.positions:
             cost = float(order["amount_sol"])
             self.portfolio.add_position(token_addr, f"Meme_{token_addr[:4]}",
-                                        cost / amount, amount, cost)
+                                        cost / amount, amount, cost,
+                                        mint_decimals=int(decimals))
         else:
             self.portfolio.update_holding(token_addr, amount)
         self._resolve_pending(token_addr, order, "confirmed", {"raw_balance": raw})
@@ -433,7 +436,7 @@ class StrategyRunner:
             # trader must later confirm that exact raw balance before sending.
             try:
                 decimals = await asyncio.wait_for(
-                    get_mint_decimals(token_addr, self.trader.rpc.client),
+                    self._position_mint_decimals(token_addr),
                     timeout=StrategyConfig.POSITION_BALANCE_TIMEOUT_SECONDS,
                 )
                 amount = Decimal(str(pos.amount_held))
@@ -734,6 +737,7 @@ class StrategyRunner:
         def record(metadata):
             self._record_pending_sell(token_addr, metadata["signature"], ratio, reason, metadata)
         route_cache = getattr(self, "failed_route_exclusions", {})
+        route_candidates = getattr(self, "failed_route_candidates", {})
         cached = route_cache.get(token_addr)
         excluded_dexes = None
         if cached is not None:
@@ -742,6 +746,23 @@ class StrategyRunner:
                 excluded_dexes = [label]
             else:
                 route_cache.pop(token_addr, None)
+        if excluded_dexes is None:
+            candidate = route_candidates.get(token_addr)
+            if candidate is not None:
+                program_id, labels, expiry = candidate
+                if time.time() < expiry:
+                    try:
+                        label = await self.trader.jup.get_program_id_label(program_id)
+                    except Exception as error:
+                        logger.warning(f"DEX label unavailable for prior rejected exit: {error}")
+                        label = None
+                    if label in labels:
+                        excluded_dexes = [label]
+                        route_cache[token_addr] = (label, expiry)
+                        self.failed_route_exclusions = route_cache
+                        route_candidates.pop(token_addr, None)
+                else:
+                    route_candidates.pop(token_addr, None)
         for attempt in range(2):
             try:
                 success = await self.trader.sell(
@@ -750,9 +771,15 @@ class StrategyRunner:
                     expected_raw_balance=expected_raw_balance,
                 )
             except TransactionPreflightRejected as exc:
+                labels = getattr(exc, "route_labels", [])
+                if exc.single_attempt_proven and exc.failed_program_id and labels:
+                    route_candidates[token_addr] = (
+                        exc.failed_program_id, tuple(labels),
+                        time.time() + StrategyConfig.FAILED_DEX_EXCLUSION_SECONDS,
+                    )
+                    self.failed_route_candidates = route_candidates
                 if not await self._release_preflight_rejection(token_addr, exc):
                     return False
-                labels = getattr(exc, "route_labels", [])
                 if attempt == 0 and labels and exc.failed_program_id:
                     try:
                         failed_label = await self.trader.jup.get_program_id_label(
@@ -768,6 +795,7 @@ class StrategyRunner:
                             time.time() + StrategyConfig.FAILED_DEX_EXCLUSION_SECONDS,
                         )
                         self.failed_route_exclusions = route_cache
+                        route_candidates.pop(token_addr, None)
                         logger.warning(
                             f"Requoting rejected exit for {token_addr} without DEX {failed_label}"
                         )
@@ -797,12 +825,23 @@ class StrategyRunner:
         score = torch.sigmoid(latest_logit).item()
         return score
 
+    async def _position_mint_decimals(self, token_addr):
+        pos = self.portfolio.positions.get(token_addr)
+        cached = getattr(pos, "mint_decimals", None)
+        if type(cached) is int and 0 <= cached <= 18:
+            return cached
+        decimals = await get_mint_decimals(token_addr, self.trader.rpc.client)
+        if pos is not None:
+            pos.mint_decimals = decimals
+            self.portfolio.save_state()
+        return decimals
+
     async def _fetch_live_price_sol(self, token_addr, *, raw_balance=None, decimals=None):
         """Return per-token SOL value for one token or an exact full-size exit."""
         for attempt in range(2):
             try:
                 if decimals is None:
-                    decimals = await get_mint_decimals(token_addr, self.trader.rpc.client)
+                    decimals = await self._position_mint_decimals(token_addr)
                 if raw_balance is None:
                     raw_balance = 10 ** decimals
                 if raw_balance is None or raw_balance <= 0:

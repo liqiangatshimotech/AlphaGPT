@@ -102,6 +102,39 @@ class LiveTradingGuardTests(unittest.IsolatedAsyncioTestCase):
                 await self.runner._fetch_live_price_sol(TOKEN, raw_balance=RAW_BALANCE)
         self.assertEqual(self.runner.trader.jup.get_quote.await_count, 1)
 
+    async def test_mint_precision_rpc_outage_cannot_trigger_false_stop(self):
+        self.runner.portfolio.add_position(TOKEN, "NINE", 0.01, 100.0, 1.0)
+        self.runner.trader.rpc.get_token_balance.return_value = 100_000_000_000
+        self.runner._execute_sell = AsyncMock()
+        with patch(
+            "strategy_manager.runner.get_mint_decimals",
+            new=AsyncMock(side_effect=TimeoutError("mint RPC unavailable")),
+        ):
+            await self.runner.monitor_positions()
+
+        self.runner._execute_sell.assert_not_awaited()
+        self.runner.trader.jup.get_quote.assert_not_awaited()
+
+    async def test_verified_mint_precision_is_cached_for_rpc_outage(self):
+        self.runner.portfolio.add_position(TOKEN, "NINE", 0.01, 100.0, 1.0)
+        pos = self.runner.portfolio.positions[TOKEN]
+        pos.mint_decimals = 9
+        self.runner.portfolio.save_state()
+        self.runner.trader.jup.get_quote.return_value = {"outAmount": "900000000"}
+        with patch(
+            "strategy_manager.runner.get_mint_decimals",
+            new=AsyncMock(side_effect=TimeoutError("mint RPC unavailable")),
+        ) as mint_reader:
+            price = await self.runner._fetch_live_price_sol(
+                TOKEN, raw_balance=100_000_000_000
+            )
+
+        self.assertAlmostEqual(price, 0.009)
+        mint_reader.assert_not_awaited()
+        self.runner.trader.jup.get_quote.assert_awaited_with(
+            input_mint=TOKEN, output_mint="SOL", amount_integer=100_000_000_000
+        )
+
     async def test_full_exit_loss_triggers_stop_even_when_spot_does_not(self):
         self._position()
         self.runner._fetch_live_price_sol = AsyncMock(
@@ -385,6 +418,44 @@ class LiveTradingGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(calls[0]["exclude_dexes"])
         self.assertEqual(calls[1]["exclude_dexes"], ["GoonFi"])
         self.assertNotIn(TOKEN, self.runner.pending_orders)
+        self.runner.trader.sell = AsyncMock(return_value=False)
+        await self.runner._execute_sell(TOKEN, 1.0, "StopLoss")
+        self.assertEqual(
+            self.runner.trader.sell.await_args.kwargs["exclude_dexes"], ["GoonFi"]
+        )
+
+    async def test_preflight_proof_timeout_keeps_route_for_next_cycle(self):
+        self._position()
+        error = TransactionPreflightRejected(
+            "rejected-signature", "simulation failed", simulation_error="0x24",
+            single_attempt_proven=True,
+            logs=["Program goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE failed: custom program error: 0x24"],
+        )
+        error.route_labels = ["GoonFi"]
+        never = asyncio.Event()
+
+        async def first_sell(_token, **kwargs):
+            kwargs["on_submitting"]({
+                "signature": "rejected-signature", "pre_raw_balance": RAW_BALANCE,
+                "amount_raw": RAW_BALANCE, "decimals": 6,
+            })
+            raise error
+
+        async def slow_proof(*_):
+            await never.wait()
+
+        self.runner.trader.sell = AsyncMock(side_effect=first_sell)
+        self.runner._release_preflight_rejection = AsyncMock(side_effect=slow_proof)
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                self.runner._execute_sell(TOKEN, 1.0, "StopLoss"), timeout=0.01
+            )
+        self.assertIn(TOKEN, self.runner.pending_orders)
+        self.assertIn(TOKEN, self.runner.failed_route_candidates)
+
+        # Once independent recovery clears the old signature, the next exit
+        # attempt maps the remembered program and avoids its DEX.
+        self.runner.pending_orders.pop(TOKEN)
         self.runner.trader.sell = AsyncMock(return_value=False)
         await self.runner._execute_sell(TOKEN, 1.0, "StopLoss")
         self.assertEqual(

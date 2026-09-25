@@ -8,8 +8,10 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -89,6 +91,20 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(send.await_args.args[0].count("POSITION REPORT"), 1)
         self.assertTrue(send.await_args.args[0].startswith("AI SUMMARY\n\nPOSITION REPORT"))
 
+    async def test_quarantine_warning_is_sent_even_if_ai_summary_omits_it(self):
+        snapshot = self.snapshot()
+        snapshot.warnings.append(
+            "Zero-balance quarantine: Meme_ABCD (" + "A" * 44 + "); manual chain audit required"
+        )
+        with patch.object(monitor, "collect_snapshot", AsyncMock(return_value=snapshot)), \
+                patch.object(monitor, "position_report", AsyncMock(return_value="")), \
+                patch.object(monitor, "deepseek_summary", AsyncMock(return_value="AI SUMMARY")), \
+                patch.object(monitor, "send_dingtalk", AsyncMock()) as send, redirect_stdout(io.StringIO()):
+            await monitor.run_once()
+        content = send.await_args.args[0]
+        self.assertIn("零余额隔离告警（需人工核查）", content)
+        self.assertIn("Meme_ABCD (" + "A" * 44 + ")", content)
+
     async def test_deepseek_payload_preserves_configured_model_and_response(self):
         session = FakeSession(FakeResponse({"choices": [{"message": {"content": "  summary  "}}]}))
         with patch.dict(os.environ, {"DEEPSEEK_MODEL": "fixture-model", "DEEPSEEK_API_KEY": "fixture-key"}), \
@@ -138,6 +154,79 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("PostgreSQL unavailable: RuntimeError", snapshot.warnings)
         connection.close.assert_awaited_once()
         rpc.assert_awaited_once_with(session, "getBalance", ["A" * 44])
+
+    async def test_snapshot_surfaces_recent_quarantine_from_runner_log(self):
+        token = "A" * 44
+        now = time.time()
+        timestamp = datetime.fromtimestamp(now - 60).strftime("%Y-%m-%d %H:%M:%S")
+        (self.root / "logs").mkdir()
+        (self.root / "logs/runner.error.log").write_text(
+            f"{timestamp} | ERROR | Zero on-chain balance for Meme_AAAA ({token}) "
+            "at confirmed and finalized commitment; retaining position for audit (observed 0s).\n"
+        )
+        (self.root / "portfolio_state.json").write_text(json.dumps({
+            token: {"symbol": "Meme_AAAA", "token_address": token}
+        }))
+        with patch.object(monitor, "runner_process", return_value=(True, 1234)), \
+                patch.object(monitor, "rpc_call", AsyncMock()), \
+                patch.object(monitor, "Keypair", SimpleNamespace(
+                    from_base58_string=Mock(side_effect=ValueError("offline"))
+                )):
+            snapshot = await monitor.collect_snapshot()
+        self.assertTrue(any(
+            warning.startswith("Zero-balance quarantine: Meme_AAAA")
+            for warning in snapshot.warnings
+        ))
+
+    def test_quarantine_alerts_ignore_stale_and_restored_events(self):
+        token = "A" * 44
+        positions = [{"token": token, "symbol": "Meme_AAAA"}]
+        now = time.time()
+
+        def log_line(offset, message):
+            timestamp = datetime.fromtimestamp(now + offset).strftime("%Y-%m-%d %H:%M:%S")
+            return f"{timestamp} | INFO | {message}"
+
+        zero = (
+            f"Zero on-chain balance for Meme_AAAA ({token}) at confirmed and "
+            "finalized commitment; retaining position for audit (observed 0s)."
+        )
+        self.assertEqual(monitor.quarantine_warnings(
+            positions, lines=[log_line(-7201, zero)], now=now
+        ), [])
+        self.assertEqual(monitor.quarantine_warnings(
+            positions, lines=[
+                log_line(-60, zero),
+                log_line(-30, "On-chain balance restored for Meme_AAAA; resuming monitoring."),
+            ], now=now
+        ), [])
+        self.assertEqual(monitor.quarantine_warnings(
+            positions, lines=[
+                log_line(-60, zero),
+                log_line(-30, "Loaded Strategy: [1, 2, 3]"),
+            ], now=now
+        ), [])
+        self.assertEqual(len(monitor.quarantine_warnings(
+            positions, lines=[
+                log_line(-60, zero),
+                log_line(-30, "Loaded Strategy: [1, 2, 3]"),
+                log_line(-20, zero),
+            ], now=now
+        )), 1)
+
+    def test_quarantine_alert_is_not_displaced_by_other_recent_events(self):
+        token = "A" * 44
+        now = time.time()
+        timestamp = datetime.fromtimestamp(now - 60).strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            f"{timestamp} | ERROR | Zero on-chain balance for Meme_AAAA ({token}) "
+            "at confirmed and finalized commitment; retaining position for audit (observed 0s)."
+        ] + [f"{timestamp} | INFO | Transaction Sent: {'B' * 64}" for _ in range(30)]
+        warnings = monitor.quarantine_warnings(
+            [{"token": token, "symbol": "Meme_AAAA"}], lines=lines, now=now
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(len(monitor.recent_log_events(lines=lines)), 20)
 
     async def test_cli_once_and_dry_run_exit_after_one_mock_iteration(self):
         for args, expected in ((["--once"], False), (["--dry-run"], True)):

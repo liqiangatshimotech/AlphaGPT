@@ -34,6 +34,8 @@ from monitor_exit_distance import position_report
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 FRESHNESS_THRESHOLD_SECONDS = int(os.getenv("MONITOR_FRESHNESS_THRESHOLD_SECONDS", "1200"))
+QUARANTINE_ALERT_MAX_AGE_SECONDS = 2 * 3600
+QUARANTINE_WARNING_PREFIX = "Zero-balance quarantine: "
 
 
 def env(name: str, default: str = "") -> str:
@@ -121,21 +123,83 @@ def _sanitize_log_line(line: str) -> str:
     return line[-500:]
 
 
-def recent_log_events(limit: int = 20) -> list[str]:
+def _active_log_lines() -> list[str]:
     # loguru writes to launchd's stderr file; preserve the old paths as fallbacks.
     candidates = [ROOT / "logs/runner.error.log", ROOT / "logs/runner.log", ROOT / "strategy.log"]
     path = next((candidate for candidate in candidates if candidate.exists()), None)
-    if path is None or limit <= 0:
+    if path is None:
         return []
     try:
-        lines = path.read_text(errors="replace").splitlines()
+        return path.read_text(errors="replace").splitlines()
     except OSError:
         return []
+
+
+def recent_log_events(limit: int = 20, *, lines: list[str] | None = None) -> list[str]:
+    if limit <= 0:
+        return []
+    if lines is None:
+        lines = _active_log_lines()
     interesting = re.compile(
         r"(BUY Successful|SELL Successful|Transaction (Sent|Confirmed|Failed)|Jupiter .*Error|"
         r"Birdeye .*Error|Global Loop Error|STOP|AI EXIT|STOP LOSS|TRAILING STOP|MOONBAG TP)", re.I,
     )
     return [_sanitize_log_line(line) for line in [line for line in lines if interesting.search(line)][-limit:]]
+
+
+def quarantine_warnings(
+    positions: list[dict[str, Any]], *, lines: list[str] | None = None,
+    now: float | None = None,
+) -> list[str]:
+    """Report recent zero-balance quarantines still present in saved positions."""
+    if lines is None:
+        lines = _active_log_lines()
+    if now is None:
+        now = time.time()
+    current = {
+        position.get("token"): position.get("symbol")
+        for position in positions if position.get("token")
+    }
+    if not current:
+        return []
+    by_symbol: dict[str, list[str]] = {}
+    for token, symbol in current.items():
+        by_symbol.setdefault(symbol, []).append(token)
+    quarantined: dict[str, float] = {}
+    zero_event = re.compile(
+        r"Zero on-chain balance for .+? \(([1-9A-HJ-NP-Za-km-z]{32,44})\) "
+        r"at confirmed and finalized commitment; retaining position for audit"
+    )
+    restored_event = re.compile(r"On-chain balance restored for (.+?); resuming monitoring\.")
+    for line in lines:
+        timestamp = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", line)
+        if timestamp is None:
+            continue
+        try:
+            observed_at = datetime.fromisoformat(timestamp.group(1)).timestamp()
+        except ValueError:
+            continue
+        if observed_at > now + 300 or now - observed_at > QUARANTINE_ALERT_MAX_AGE_SECONDS:
+            continue
+        if "Loaded Strategy:" in line:
+            # A new runner does not inherit the previous process's quarantine.
+            # Its startup balance check will report any still-zero position.
+            quarantined.clear()
+            continue
+        zero = zero_event.search(line)
+        if zero and zero.group(1) in current:
+            quarantined[zero.group(1)] = observed_at
+        restored = restored_event.search(line)
+        if restored:
+            tokens = by_symbol.get(restored.group(1), [])
+            # A symbol can repeat; only clear an unambiguous restoration.
+            if len(tokens) == 1:
+                quarantined.pop(tokens[0], None)
+    return [
+        f"{QUARANTINE_WARNING_PREFIX}{current[token]} ({token}); "
+        f"last observed {max(0, int((now - observed_at) // 60))} min ago; manual chain audit required"
+        for token, observed_at in quarantined.items()
+    ]
 
 
 def signature_from_logs(events: list[str]) -> list[str]:
@@ -194,7 +258,10 @@ async def collect_snapshot() -> Snapshot:
             except Exception as exc:
                 warnings.append(f"PostgreSQL close failed: {type(exc).__name__}")
 
-    events = recent_log_events()
+    positions = local_positions()
+    log_lines = _active_log_lines()
+    events = recent_log_events(lines=log_lines)
+    warnings.extend(quarantine_warnings(positions, lines=log_lines))
     transactions = [
         {"signature": sig, "solscan": f"https://solscan.io/tx/{sig}"}
         for sig in signature_from_logs(events)[-5:]
@@ -229,7 +296,7 @@ async def collect_snapshot() -> Snapshot:
             warnings.append(f"market data is {age / 60:.1f} minutes old")
     return Snapshot(
         datetime.now(timezone.utc).isoformat(), running, pid, paused, redact(wallet_address),
-        balance, db_rows, db_tokens, db_latest, local_positions(), transactions, events, warnings,
+        balance, db_rows, db_tokens, db_latest, positions, transactions, events, warnings,
     )
 
 
@@ -298,6 +365,13 @@ async def run_once(dry_run: bool = False) -> None:
         summary = fallback_summary(snapshot)
     if report:
         summary += "\n\n" + report
+    quarantine_alerts = [
+        warning for warning in snapshot.warnings
+        if warning.startswith(QUARANTINE_WARNING_PREFIX)
+    ]
+    if quarantine_alerts:
+        # Keep the alert in the outgoing text even if the generated summary omits it.
+        summary += "\n\n零余额隔离告警（需人工核查）：\n" + "\n".join(quarantine_alerts)
     content = f"{summary}\n\n采集时间：{display_time(snapshot.collected_at_utc)}"
     if dry_run:
         print(content)

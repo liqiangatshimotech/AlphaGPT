@@ -19,6 +19,7 @@ class Position:
     # track the value of selling the whole remaining position.
     highest_price_basis: str = "spot"
     highest_price_initialized: bool = True
+    mint_decimals: int | None = None
 
 class PortfolioManager:
     def __init__(self, state_file="portfolio_state.json"):
@@ -26,7 +27,7 @@ class PortfolioManager:
         self.positions: Dict[str, Position] = {}
         self.load_state()
 
-    def add_position(self, token, symbol, price, amount, cost_sol):
+    def add_position(self, token, symbol, price, amount, cost_sol, *, mint_decimals=None):
         self.positions[token] = Position(
             token_address=token,
             symbol=symbol,
@@ -37,6 +38,7 @@ class PortfolioManager:
             highest_price=price,
             highest_price_basis="full_exit",
             highest_price_initialized=False,
+            mint_decimals=mint_decimals,
         )
         self.save_state()
         logger.info(f"[+] Position Added: {symbol} @ {price}")

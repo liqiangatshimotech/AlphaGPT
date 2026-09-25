@@ -62,6 +62,16 @@ runner, back up `portfolio_state.json`, remove only that verified position from
 the saved state, then restart and recheck balances. Do not clear a position on
 one provider's zero response alone.
 
+The optional monitor bot scans recent runner logs for zero-balance quarantine
+events tied to currently saved positions and includes a manual-audit warning
+in its outgoing summary. This addition takes effect after the monitor bot's
+next restart; it does not itself resolve or remove a position.
+
+Mint precision is read from Solana `getTokenSupply` and cached in each position.
+An unavailable mint response is never assumed to have six decimals; if no
+verified precision is cached, that position's quote-based exit check is
+deferred rather than risking a false stop-loss sale.
+
 ## State and pending transactions
 
 Keep these files with the existing wallet deployment, outside version control:
@@ -87,7 +97,10 @@ An explicitly rejected preflight simulation from a single-attempt send can be
 released sooner, but only after the historical signature query is absent and
 the finalized token balance equals the pre-submission balance. A transport
 timeout remains pending. For a DEX program failure, the runner maps the program
-ID through Jupiter and retries once with that specific DEX excluded.
+ID through Jupiter and retries once with that specific DEX excluded. The
+failure program ID is kept in memory before reconciliation awaits, so a
+timeout after a preflight rejection can inform the next sell attempt in this
+process. Pending-order safety checks still take precedence over route changes.
 The RPC node's default rebroadcasting remains enabled until finalization or
 blockhash expiry. While any order is pending, the runner checks recovery every
 10 seconds; it does not issue a new quote merely because confirmation is slow.
