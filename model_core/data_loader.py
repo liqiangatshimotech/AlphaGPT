@@ -8,6 +8,7 @@ before any missing values are forward filled into the feature tensor.
 from datetime import datetime, timedelta, timezone
 import math
 
+import numpy as np
 import pandas as pd
 import sqlalchemy
 import torch
@@ -23,6 +24,11 @@ class CryptoDataLoader:
         self.raw_data_cache = None
         self.target_ret = None
         self.addresses = []
+        # Shared UTC time axis and actual SQL-row provenance for the tensors.
+        # observed_mask is [token, time] and stays false for both pre-listing
+        # zeros and forward-filled gaps or stale tails.
+        self.timestamps = []
+        self.observed_mask = None
         # Actual last stored candle for each selected address, never a time
         # inferred from the forward-filled feature matrix.
         self.latest_candle_times = {}
@@ -63,14 +69,24 @@ class CryptoDataLoader:
         self.raw_data_cache = None
         self.target_ret = None
         self.addresses = []
+        self.timestamps = []
+        self.observed_mask = None
         self.latest_candle_times = {}
 
         print("Loading data from SQL...")
+        valid_candle_sql = """
+            o.open > 0 AND o.high > 0 AND o.low > 0 AND o.close > 0
+            AND o.open < 1e30 AND o.high < 1e30
+            AND o.low < 1e30 AND o.close < 1e30
+            AND o.volume >= 0 AND o.volume < 1e30
+            AND o.high >= o.open AND o.high >= o.close
+            AND o.low <= o.open AND o.low <= o.close
+        """
         freshness_clause = "HAVING MAX(o.time) BETWEEN :cutoff AND :as_of" if max_candle_age_seconds is not None else ""
         top_query = sqlalchemy.text(f"""
             SELECT t.address, MAX(o.time) AS latest_candle_time
             FROM tokens AS t
-            JOIN ohlcv AS o ON o.address = t.address
+            JOIN ohlcv AS o ON o.address = t.address AND {valid_candle_sql}
             GROUP BY t.address
             {freshness_clause}
             ORDER BY COUNT(*) DESC, t.address ASC
@@ -86,10 +102,11 @@ class CryptoDataLoader:
 
         # Select by bound parameters rather than interpolating token addresses
         # supplied by the database into a second SQL statement.
-        data_query = sqlalchemy.text("""
-            SELECT time, address, open, high, low, close, volume, liquidity, fdv
-            FROM ohlcv
-            WHERE address IN :addresses
+        data_query = sqlalchemy.text(f"""
+            SELECT o.time, o.address, o.open, o.high, o.low, o.close,
+                   o.volume, o.liquidity, o.fdv
+            FROM ohlcv AS o
+            WHERE o.address IN :addresses AND {valid_candle_sql}
             ORDER BY time ASC
         """).bindparams(sqlalchemy.bindparam("addresses", expanding=True))
         df = pd.read_sql(data_query, self.engine, params={"addresses": addresses})
@@ -101,9 +118,33 @@ class CryptoDataLoader:
             for row in selected.itertuples(index=False)
         }
 
+        # Build provenance before forward fill. A database row with a missing
+        # or invalid price/volume is not an observed candle for causal models.
+        values = df[["open", "high", "low", "close", "volume"]].to_numpy(dtype=np.float64)
+        open_, high, low, close, volume = values.T
+        valid_candle = (
+            np.isfinite(values).all(axis=1)
+            & (open_ > 0) & (high > 0) & (low > 0) & (close > 0)
+            & (volume >= 0)
+            & (high >= np.maximum(open_, close))
+            & (low <= np.minimum(open_, close))
+        )
+        observed = (df[["time", "address"]].assign(_observed=valid_candle)
+                    .pivot(index="time", columns="address", values="_observed")
+                    .reindex(columns=addresses)
+                    .astype("boolean")
+                    .fillna(False).astype(bool))
+        timestamps = [stamp.to_pydatetime()
+                      for stamp in pd.to_datetime(observed.index, utc=True)]
+        observed_mask = torch.tensor(
+            observed.to_numpy(dtype=bool).T.copy(),
+            dtype=torch.bool,
+            device=ModelConfig.DEVICE,
+        )
+
         def to_tensor(col):
             pivot = df.pivot(index="time", columns="address", values=col)
-            pivot = pivot.reindex(columns=addresses)
+            pivot = pivot.reindex(index=observed.index, columns=addresses)
             pivot = pivot.ffill().fillna(0.0)
             return torch.tensor(pivot.values.T, dtype=torch.float32, device=ModelConfig.DEVICE)
 
@@ -124,6 +165,8 @@ class CryptoDataLoader:
         target_ret[:, -2:] = 0.0
 
         self.addresses = addresses
+        self.timestamps = timestamps
+        self.observed_mask = observed_mask
         self.latest_candle_times = latest_candle_times
         self.raw_data_cache = raw_data_cache
         self.feat_tensor = feat_tensor

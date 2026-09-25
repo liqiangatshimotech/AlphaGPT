@@ -31,6 +31,7 @@ class BirdeyeProvider(DataProvider):
         # burst when trending and OHLCV requests are made by the same process.
         self._rate_lock = asyncio.Lock()
         self._last_request_at = 0.0
+        self.last_trending_status = "never_called"
 
     @staticmethod
     def _as_float(value, default=0.0):
@@ -133,6 +134,7 @@ class BirdeyeProvider(DataProvider):
         raise RuntimeError(f"Birdeye retries exhausted for {path}")
 
     async def get_trending_tokens(self, limit=50):
+        self.last_trending_status = "in_progress"
         limit = min(max(int(limit), 1), 50)
         params = {
             "sort_by": "rank",
@@ -143,7 +145,11 @@ class BirdeyeProvider(DataProvider):
         try:
             async with aiohttp.ClientSession(headers=self.headers) as session:
                 data = await self._get_json(session, "/defi/token_trending", params)
-            raw_list = data.get("data", {}).get("tokens", [])
+            payload = data.get("data") if isinstance(data, dict) else None
+            raw_list = payload.get("tokens") if isinstance(payload, dict) else None
+            if not isinstance(raw_list, list):
+                raise ValueError("Birdeye trending response has no token list")
+            self.last_trending_status = "success"
             return [
                 {
                     "address": t["address"],
@@ -156,6 +162,7 @@ class BirdeyeProvider(DataProvider):
                 for t in raw_list
             ]
         except Exception as exc:
+            self.last_trending_status = "error"
             logger.error(f"Birdeye Trending Exception: {exc}")
             return []
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import sqlalchemy
+import torch
 
 from model_core.config import ModelConfig
 from model_core.data_loader import CryptoDataLoader
@@ -67,6 +68,82 @@ class DataLoaderFreshnessTests(unittest.TestCase):
         self.assertEqual(tuple(loader.feat_tensor.shape[:2]), (2, 6))
         self.assertEqual(loader.raw_data_cache["liquidity"][:, -1].tolist(),
                          [300_000, 400_000])
+        self.assertEqual(loader.observed_mask.dtype, torch.bool)
+        self.assertEqual(loader.observed_mask.shape,
+                         loader.raw_data_cache["open"].shape)
+        self.assertEqual(loader.timestamps, [
+            self.as_of - timedelta(minutes=31),
+            self.as_of - timedelta(minutes=30),
+            self.as_of - timedelta(minutes=12),
+            self.as_of - timedelta(minutes=11),
+            self.as_of - timedelta(minutes=10),
+        ])
+        self.assertEqual(loader.observed_mask.tolist(), [
+            [False, False, True, True, True],
+            [True, True, False, False, False],
+        ])
+        # The feature tensor still uses the pre-existing zero/forward-fill
+        # behavior, while the mask records which values came from SQL rows.
+        self.assertEqual(loader.raw_data_cache["open"][:, [0, -1]].tolist(),
+                         [[0.0, 1.0], [1.0, 1.0]])
+
+    def test_observed_mask_marks_internal_gap_even_when_price_is_forward_filled(self):
+        engine = sqlalchemy.create_engine(ModelConfig.DB_URL)
+        with engine.begin() as conn:
+            conn.execute(sqlalchemy.text("""
+                DELETE FROM ohlcv WHERE address = 'fresh' AND time = :time
+            """), {"time": (self.as_of - timedelta(minutes=11))
+                   .replace(tzinfo=None).isoformat(sep=" ")})
+            self._insert(conn, "boundary", (11,), liquidity=400_000)
+        engine.dispose()
+
+        loader = CryptoDataLoader()
+        loader.load_data(limit_tokens=2, max_candle_age_seconds=1800,
+                         as_of=self.as_of)
+
+        row = loader.addresses.index("fresh")
+        gap = loader.timestamps.index(self.as_of - timedelta(minutes=11))
+        self.assertFalse(loader.observed_mask[row, gap].item())
+        self.assertEqual(loader.raw_data_cache["open"][row, gap].item(), 1.0)
+        self.assertTrue(loader.observed_mask[row, gap - 1].item())
+        self.assertTrue(loader.observed_mask[row, gap + 1].item())
+
+    def test_nullable_candle_field_is_not_treated_as_observed(self):
+        engine = sqlalchemy.create_engine(ModelConfig.DB_URL)
+        at = (self.as_of - timedelta(minutes=9)).replace(tzinfo=None).isoformat(sep=" ")
+        with engine.begin() as conn:
+            conn.execute(sqlalchemy.text("""
+                INSERT INTO ohlcv (
+                    time, address, open, high, low, close, volume, liquidity, fdv
+                ) VALUES (:time, 'fresh', 1, NULL, 0.9, 1, 100, 300000, 2000000)
+            """), {"time": at})
+            self._insert(conn, "boundary", (9,), liquidity=400_000)
+        engine.dispose()
+
+        loader = CryptoDataLoader()
+        loader.load_data(limit_tokens=2, max_candle_age_seconds=1800, as_of=self.as_of)
+
+        row = loader.addresses.index("fresh")
+        self.assertEqual(loader.latest_candle_times["fresh"],
+                         self.as_of - timedelta(minutes=10))
+        self.assertFalse(loader.observed_mask[row, -1].item())
+        self.assertAlmostEqual(loader.raw_data_cache["high"][row, -1].item(), 1.1)
+
+    def test_invalid_recent_row_cannot_resurrect_stale_token(self):
+        engine = sqlalchemy.create_engine(ModelConfig.DB_URL)
+        at = (self.as_of - timedelta(minutes=1)).replace(tzinfo=None).isoformat(sep=" ")
+        with engine.begin() as conn:
+            conn.execute(sqlalchemy.text("""
+                INSERT INTO ohlcv (
+                    time, address, open, high, low, close, volume, liquidity, fdv
+                ) VALUES (:time, 'stale', 1, 1.1, 0.9, NULL, 100, 9000000, 2000000)
+            """), {"time": at})
+        engine.dispose()
+
+        loader = CryptoDataLoader()
+        loader.load_data(limit_tokens=3, max_candle_age_seconds=1800, as_of=self.as_of)
+
+        self.assertNotIn("stale", loader.addresses)
 
     def test_historical_default_preserves_count_based_selection(self):
         loader = CryptoDataLoader()
@@ -84,6 +161,8 @@ class DataLoaderFreshnessTests(unittest.TestCase):
                              as_of=self.as_of + timedelta(days=1))
 
         self.assertEqual(loader.addresses, [])
+        self.assertEqual(loader.timestamps, [])
+        self.assertIsNone(loader.observed_mask)
         self.assertEqual(loader.latest_candle_times, {})
         self.assertIsNone(loader.feat_tensor)
         self.assertIsNone(loader.raw_data_cache)

@@ -32,6 +32,22 @@ live filename only after reviewing its validation and live score distribution.
 The entry scanner refuses a non-finite or nearly constant score batch. A valid
 strategy file alone does not imply that live entries are enabled.
 
+For a model-recovery investigation, `TOKEN_QUOTE_SAMPLE_SIZE` controls an
+optional read-only sample of at most five Birdeye-selected mints per 15-minute
+pipeline sync (default `0`, disabled). It appends 1 SOL buy/full-sell quote
+results and failures to `TOKEN_QUOTE_SNAPSHOT_PATH` (default
+`logs/quote_snapshots.jsonl`); the same sync records the observed candidate
+universe in `TOKEN_UNIVERSE_SNAPSHOT_PATH` (default
+`logs/token_universe_snapshots.jsonl`). Birdeye returns at most 50 trending
+mints here, not the full market. Quote sampling shares the Jupiter API budget
+with live exits, so monitor rate limits and exit latency after enabling it.
+Quotes are collected after the OHLCV refresh; use each quote row's own request
+time and check its delay from the discovery snapshot before analysis.
+These logs contain no wallet key and do
+not build, sign, or send transactions. They supply prospective cost and
+universe evidence; [the recovery plan](model-recovery-2026-09-25.md) explains
+why they cannot justify live promotion on their own.
+
 ## Entry and exit safeguards
 
 `MAX_SIGNAL_CANDLE_AGE_SECONDS` defaults to 1800. A live candidate must have an
