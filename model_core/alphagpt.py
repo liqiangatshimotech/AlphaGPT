@@ -219,18 +219,22 @@ class LoopedTransformer(nn.Module):
 
 
 class AlphaGPT(nn.Module):
-    def __init__(self):
+    def __init__(self, input_vocab_size=None, output_size=None, max_len=None):
+        """Defaults reproduce the v2 policy. The v3 search passes extra input
+        ids (BOS) and an extra output action (STOP) without changing v2."""
         super().__init__()
         self.d_model = 64
         self.features_list = list(FORMULA_VOCAB.feature_names)
         self.ops_list = list(FORMULA_VOCAB.operator_names)
         
         self.vocab = list(FORMULA_VOCAB.token_names)
-        self.vocab_size = FORMULA_VOCAB.size
+        self.vocab_size = output_size or FORMULA_VOCAB.size
+        input_vocab_size = input_vocab_size or FORMULA_VOCAB.size
+        max_len = max_len or ModelConfig.MAX_FORMULA_LEN
         
         # Embedding
-        self.token_emb = nn.Embedding(self.vocab_size, self.d_model)
-        self.pos_emb = nn.Parameter(torch.zeros(1, ModelConfig.MAX_FORMULA_LEN + 1, self.d_model))
+        self.token_emb = nn.Embedding(input_vocab_size, self.d_model)
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_len + 1, self.d_model))
         
         # Enhanced Transformer with Looped Transformer
         self.blocks = LoopedTransformer(
