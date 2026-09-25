@@ -15,6 +15,10 @@ class Position:
     initial_cost_sol: float # 初始投入 SOL
     highest_price: float   #以此计算回撤
     is_moonbag: bool = False # 是否已经翻倍出本，剩下的让利润奔跑
+    # Older persisted positions have spot-quote high-water marks. New entries
+    # track the value of selling the whole remaining position.
+    highest_price_basis: str = "spot"
+    highest_price_initialized: bool = True
 
 class PortfolioManager:
     def __init__(self, state_file="portfolio_state.json"):
@@ -30,7 +34,9 @@ class PortfolioManager:
             entry_time=time.time(),
             amount_held=amount,
             initial_cost_sol=cost_sol,
-            highest_price=price
+            highest_price=price,
+            highest_price_basis="full_exit",
+            highest_price_initialized=False,
         )
         self.save_state()
         logger.info(f"[+] Position Added: {symbol} @ {price}")

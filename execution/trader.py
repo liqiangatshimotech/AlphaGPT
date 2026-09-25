@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from loguru import logger
 from solders.pubkey import Pubkey
 from solana.rpc.types import TokenAccountOpts
@@ -8,6 +9,7 @@ from .config import ExecutionConfig
 from .rpc_handler import (
     QuickNodeClient,
     TransactionFailed,
+    TransactionPreflightRejected,
     TransactionStatusUnknown,
 )
 from .jupiter import JupiterAggregator
@@ -98,8 +100,20 @@ class SolanaTrader:
             return True
         return False
 
-    async def sell(self, token_address: str, percentage: float = 1.0, slippage_bps=500, *, on_submitting=None):
-        logger.info(f"Executing SELL: {percentage*100}% of {token_address} -> SOL")
+    async def sell(
+        self, token_address: str, percentage: float = 1.0, slippage_bps=500,
+        *, on_submitting=None, exclude_dexes=None, expected_raw_balance=None,
+    ):
+        try:
+            if isinstance(percentage, bool):
+                raise InvalidOperation("boolean percentage")
+            ratio = Decimal(str(percentage))
+            if not ratio.is_finite() or not 0 < ratio <= 1:
+                raise InvalidOperation("percentage outside (0, 1]")
+        except (InvalidOperation, ValueError):
+            logger.warning(f"Invalid sell percentage for {token_address}: {percentage!r}")
+            return False
+        logger.info(f"Executing SELL: {ratio * 100}% of {token_address} -> SOL")
         raw_balance = 0
         decimals = None
         try:
@@ -122,7 +136,16 @@ class SolanaTrader:
             if raw_balance == 0:
                 logger.warning(f"No balance found for {token_address}, skipping sell.")
                 return False
-            sell_amount = int(raw_balance * percentage)
+            if expected_raw_balance is not None and raw_balance != int(expected_raw_balance):
+                logger.warning(
+                    f"Sell balance changed for {token_address}: expected "
+                    f"{expected_raw_balance}, found {raw_balance}; requote before selling."
+                )
+                return False
+            sell_amount = (
+                raw_balance if ratio == 1 else
+                int((Decimal(raw_balance) * ratio).to_integral_value(rounding=ROUND_DOWN))
+            )
             if sell_amount == 0:
                 logger.warning("Sell amount is 0 (too small percentage?)")
                 return False
@@ -133,7 +156,8 @@ class SolanaTrader:
             input_mint=token_address,
             output_mint=ExecutionConfig.SOL_MINT,
             amount_integer=sell_amount,
-            slippage_bps=slippage_bps
+            slippage_bps=slippage_bps,
+            exclude_dexes=exclude_dexes,
         )
         if not quote:
             logger.error("Sell quote not found.")
@@ -148,7 +172,8 @@ class SolanaTrader:
             try:
                 async def record(metadata):
                     metadata = {**metadata, "pre_raw_balance": raw_balance,
-                                "amount_raw": sell_amount, "decimals": decimals}
+                                "amount_raw": sell_amount, "decimals": decimals,
+                                "quoted_out_lamports": int(quote["outAmount"])}
                     if on_submitting is not None:
                         result = on_submitting(metadata)
                         if inspect.isawaitable(result):
@@ -161,6 +186,15 @@ class SolanaTrader:
                 # Preserve the unknown state so the runner does not remove
                 # the position or issue a second sell.
                 raise
+            except TransactionPreflightRejected as error:
+                error.route_labels = list(dict.fromkeys(
+                    step.get("swapInfo", {}).get("label")
+                    for step in quote.get("routePlan", [])
+                    if isinstance(step, dict)
+                    and isinstance(step.get("swapInfo"), dict)
+                    and step["swapInfo"].get("label")
+                ))
+                raise
             except TransactionFailed as e:
                 logger.error(str(e))
                 return False
@@ -168,6 +202,8 @@ class SolanaTrader:
                 logger.success(f"SELL Successful: {token_address} | Tx: {sig}")
                 return True
         except TransactionStatusUnknown:
+            raise
+        except TransactionPreflightRejected:
             raise
         except Exception as e:
             logger.error(f"Sell execution failed: {e}")

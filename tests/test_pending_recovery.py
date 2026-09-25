@@ -7,6 +7,7 @@ RPC, quote, inference and order-submission boundary is a fake.
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,6 +58,11 @@ class PendingRecoveryTests(unittest.IsolatedAsyncioTestCase):
             client=object(),
             get_expiry_evidence=AsyncMock(return_value=("pending", {})),
             get_token_balance=AsyncMock(return_value=PRE_RAW_BALANCE),
+            get_wallet_transaction_delta=AsyncMock(return_value={
+                "wallet_sol_change_lamports": 960_000_000,
+                "network_fee_lamports": 105_000,
+                "source": "confirmed_transaction_meta",
+            }),
         )
         runner.trader = SimpleNamespace(rpc=rpc, sell=AsyncMock(return_value=False))
         runner._fetch_live_price_sol = AsyncMock(return_value=1.0)
@@ -158,6 +164,11 @@ class PendingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.runner._reconcile_pending_orders()
         self.assertNotIn(TOKEN, self.runner.pending_orders)
         self.assertNotIn(TOKEN, self.runner.portfolio.positions)
+        self.assertGreater(self.runner.entry_cooldowns[TOKEN], time.time())
+        archived = json.loads(Path(self.runner.order_history_path).read_text())
+        self.assertEqual(archived["evidence"]["wallet_sol_change_lamports"], 960_000_000)
+        self.assertEqual(archived["evidence"]["network_fee_lamports"], 105_000)
+        self.assertEqual(archived["evidence"]["initial_cost_sol"], 100.0)
 
     async def test_expired_unchanged_balance_releases_without_forcing_old_take_profit(self):
         self._pending_sell()
@@ -170,7 +181,7 @@ class PendingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runner.portfolio.positions[TOKEN].amount_held, 100.0)
         self.assertFalse(self.runner.portfolio.positions[TOKEN].is_moonbag)
         self.assertEqual(json.loads(self.pending_path.read_text()), {})
-        self.runner.trader.rpc.get_token_balance.assert_awaited_with(
+        self.runner.trader.rpc.get_token_balance.assert_any_await(
             TOKEN, commitment="finalized", min_context_slot=110
         )
         archive = json.loads(Path(self.runner.order_history_path).read_text())

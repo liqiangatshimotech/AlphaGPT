@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from solders.hash import Hash
 from solders.keypair import Keypair
@@ -34,6 +34,7 @@ class RecoveryRpc:
         self.found_transaction = found_transaction
         self.calls = []
         self.send_error = None
+        self.last_send_opts = None
 
     async def get_signature_statuses(self, signatures, *, search_transaction_history):
         self.calls.append(("status", search_transaction_history))
@@ -58,6 +59,7 @@ class RecoveryRpc:
 
     async def send_transaction(self, txn, opts):
         self.calls.append(("send",))
+        self.last_send_opts = opts
         if self.send_error is not None:
             raise self.send_error
         return response(txn.signatures[0])
@@ -72,6 +74,29 @@ def client(rpc):
 
 
 class RpcRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_rpc_rebroadcast_is_not_capped_at_three(self):
+        rpc = RecoveryRpc()
+        rpc.send_error = TimeoutError("response lost")
+        with self.assertRaises(TransactionStatusUnknown):
+            await client(rpc).send_and_confirm(transaction())
+        self.assertIsNone(rpc.last_send_opts.max_retries)
+
+    async def test_wallet_transaction_delta_uses_confirmed_meta(self):
+        owner = Keypair.from_seed(bytes(range(32))).pubkey()
+        message = SimpleNamespace(account_keys=[owner])
+        meta = SimpleNamespace(
+            err=None, pre_balances=[1_000_000_000],
+            post_balances=[1_920_000_000], fee=105_000,
+        )
+        value = SimpleNamespace(transaction=SimpleNamespace(
+            meta=meta, transaction=SimpleNamespace(message=message)
+        ))
+        rpc = SimpleNamespace(get_transaction=AsyncMock(return_value=response(value)))
+        with patch("execution.rpc_handler.ExecutionConfig.get_wallet_address", return_value=str(owner)):
+            delta = await client(rpc).get_wallet_transaction_delta(str(transaction().signatures[0]))
+        self.assertEqual(delta["wallet_sol_change_lamports"], 920_000_000)
+        self.assertEqual(delta["network_fee_lamports"], 105_000)
+
     async def test_send_timeout_preserves_previously_persisted_local_identity(self):
         rpc = RecoveryRpc()
         rpc.send_error = TimeoutError("response lost after broadcasting")

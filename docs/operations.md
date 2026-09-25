@@ -23,9 +23,44 @@ Solana RPC provider, including Helius. Keys must correspond to the configured
 provider endpoints.
 
 The runner requires a locally trained `best_meme_strategy.json` compatible with
-`model_core/vocab.py`. Training writes this artifact; it is not deployed from Git.
+`model_core/vocab.py`. This live artifact is not deployed from Git.
 Review `strategy_manager/config.py` before enabling live entries. Current source
 defaults are five positions and 1 SOL per entry.
+
+Training now writes `candidate_meme_strategy.json`; promote a candidate to the
+live filename only after reviewing its validation and live score distribution.
+The entry scanner refuses a non-finite or nearly constant score batch. A valid
+strategy file alone does not imply that live entries are enabled.
+
+## Entry and exit safeguards
+
+`MAX_SIGNAL_CANDLE_AGE_SECONDS` defaults to 1800. A live candidate must have an
+actual OHLCV candle within that window; forward-filled values from an older
+token cannot make it eligible. If none are fresh, entries are skipped while
+position monitoring continues. The entry liquidity minimum is $500,000,
+matching the data discovery and backtest thresholds.
+
+`MAX_ENTRY_ROUND_TRIP_COST_BPS` defaults to 300. Before buying, the runner
+quotes a sale of the full token amount expected from the exact 1 SOL buy quote.
+It rejects missing routes or expected round-trip losses above 3%. This is a
+quote-based screen, not a cap on execution slippage, fees, or later price moves.
+Confirmed stop-loss sales also block re-entry into that token for 24 hours;
+the cooldown is restored from `logs/order_recovery.jsonl` after a restart.
+
+For held tokens, stop-loss and first take-profit checks use a quote for the
+full on-chain balance. Existing positions keep their historical one-token
+high-water basis; new positions initialize and update the high-water mark with
+full-position exit quotes. When the chain balance is temporarily unavailable,
+the runner can still evaluate a stop from the saved size, but the trader must
+verify that exact balance before sending a sell. A zero
+balance at both confirmed and finalized commitment is quarantined in the
+portfolio and reported again every hour; it is not deleted without independent
+exit evidence. A quarantined position continues to occupy one of the five
+slots. To clear one, verify the zero balance with a second RPC or explorer and
+review wallet transaction history, confirm there is no pending order, stop the
+runner, back up `portfolio_state.json`, remove only that verified position from
+the saved state, then restart and recheck balances. Do not clear a position on
+one provider's zero response alone.
 
 ## State and pending transactions
 
@@ -47,6 +82,15 @@ history, then accepts expiry only after finalized block height exceeds the
 recorded bound, the signature/transaction are still absent, and finalized token
 balance matches the pre-submission balance. Missing or contradictory evidence
 keeps the order pending for investigation.
+
+An explicitly rejected preflight simulation from a single-attempt send can be
+released sooner, but only after the historical signature query is absent and
+the finalized token balance equals the pre-submission balance. A transport
+timeout remains pending. For a DEX program failure, the runner maps the program
+ID through Jupiter and retries once with that specific DEX excluded.
+The RPC node's default rebroadcasting remains enabled until finalization or
+blockhash expiry. While any order is pending, the runner checks recovery every
+10 seconds; it does not issue a new quote merely because confirmation is slow.
 
 Confirmed partial sales use actual on-chain balances and persist the first
 take-profit flag, so a restart does not sell another half of the position by
@@ -71,6 +115,10 @@ The runner defaults to a 0.20-second request interval; the monitor uses 0.25
 seconds. Keep these at or above their defaults for headroom under a 10 RPS plan.
 429 responses have bounded retries with exponential backoff. No HTTP retry in
 the quote/swap-building layer broadcasts a signed transaction.
+Jupiter HTTP requests default to a six-second timeout. Position balance reads,
+quotes and exit attempts have separate short budgets; a failure for one token
+does not stop checks for other positions. The slower Birdeye/DB pipeline sync
+runs as a background task so it cannot hold up exit monitoring.
 
 `SOLANA_RPC_TIMEOUT_SECONDS` defaults to 20 seconds;
 `SOLANA_CONFIRMATION_WAIT_SECONDS` defaults to 3 seconds before handing an

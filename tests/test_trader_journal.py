@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 from solders.pubkey import Pubkey
 
 from execution.trader import SolanaTrader
-from execution.rpc_handler import TransactionStatusUnknown
+from execution.rpc_handler import TransactionPreflightRejected, TransactionStatusUnknown
 from tests.test_rpc_recovery import transaction, client, RecoveryRpc
 
 
@@ -64,6 +64,47 @@ class TraderJournalTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("execution.trader.ExecutionConfig.get_wallet_address", return_value=self.address):
             self.assertFalse(await trader.sell(self.address, on_submitting=fail))
+        self.assertFalse(any(call[0] == "send" for call in wire.calls))
+
+    async def test_sell_preserves_preflight_rejection_and_route_labels(self):
+        trader, _ = self.make_trader()
+        trader.jup.get_quote.return_value = {
+            "outAmount": "1000000000",
+            "routePlan": [{"swapInfo": {"label": "GoonFi"}}],
+        }
+        error = TransactionPreflightRejected(
+            str(self.tx.signatures[0]), "simulation failed", single_attempt_proven=True
+        )
+        trader.rpc.send_and_confirm = AsyncMock(side_effect=error)
+
+        with patch("execution.trader.ExecutionConfig.get_wallet_address", return_value=self.address):
+            with self.assertRaises(TransactionPreflightRejected) as caught:
+                await trader.sell(self.address, exclude_dexes=["AnotherDEX"])
+
+        self.assertIs(caught.exception, error)
+        self.assertEqual(error.route_labels, ["GoonFi"])
+        self.assertEqual(trader.jup.get_quote.await_args.kwargs["exclude_dexes"], ["AnotherDEX"])
+
+    async def test_full_and_partial_sell_size_do_not_round_large_raw_balance(self):
+        large_raw = 2**53 + 3
+        for ratio, expected in ((1.0, large_raw), (0.5, large_raw // 2)):
+            with self.subTest(ratio=ratio):
+                trader, wire = self.make_trader()
+                wire.get_token_accounts_by_owner_json_parsed.return_value.value[0].account.data.parsed[
+                    "info"
+                ]["tokenAmount"]["amount"] = str(large_raw)
+                with patch("execution.trader.ExecutionConfig.get_wallet_address", return_value=self.address):
+                    with self.assertRaises(TransactionStatusUnknown):
+                        await trader.sell(self.address, percentage=ratio)
+                self.assertEqual(trader.jup.get_quote.await_args.kwargs["amount_integer"], expected)
+
+    async def test_fallback_stop_never_sells_a_different_on_chain_amount(self):
+        trader, wire = self.make_trader()
+        with patch("execution.trader.ExecutionConfig.get_wallet_address", return_value=self.address):
+            self.assertFalse(
+                await trader.sell(self.address, expected_raw_balance=99_999_999)
+            )
+        trader.jup.get_quote.assert_not_awaited()
         self.assertFalse(any(call[0] == "send" for call in wire.calls))
 
 

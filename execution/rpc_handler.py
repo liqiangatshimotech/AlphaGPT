@@ -1,11 +1,15 @@
 import asyncio
 import inspect
 import os
+import re
 from datetime import datetime, timezone
 
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
+from solana.rpc.core import RPCException
 from solana.rpc.models import TxOpts
+from solana.rpc.providers.async_http import AsyncHTTPProvider
+from solana.rpc.providers.core import _after_request_unparsed, _parse_raw
 from solana.rpc.types import TokenAccountOpts
 from solders.pubkey import Pubkey
 from solders.signature import Signature
@@ -13,7 +17,8 @@ from solders.commitment_config import CommitmentLevel
 from solders.account_decoder import UiAccountEncoding
 from solders.rpc.config import RpcAccountInfoConfig, RpcTokenAccountsFilterMint
 from solders.rpc.requests import GetTokenAccountsByOwner
-from solders.rpc.responses import GetTokenAccountsByOwnerJsonParsedResp
+from solders.rpc.errors import SendTransactionPreflightFailureMessage
+from solders.rpc.responses import GetTokenAccountsByOwnerJsonParsedResp, SendTransactionResp
 from loguru import logger
 from .config import ExecutionConfig
 
@@ -40,6 +45,33 @@ class TransactionFailed(RuntimeError):
         super().__init__(f"Transaction failed: {self.signature}: {error}")
 
 
+class TransactionPreflightRejected(RuntimeError):
+    """The RPC returned a structured failed simulation for this signed transaction.
+
+    A local signature was already journaled, so callers must still reconcile it
+    before attempting a new swap. ``single_attempt_proven`` distinguishes our
+    one-shot HTTP submission from a client that may silently retry a POST.
+    """
+
+    def __init__(
+        self, signature, reason, *, simulation_error=None, logs=None,
+        metadata=None, single_attempt_proven=False,
+    ):
+        self.signature = str(signature)
+        self.reason = str(reason)
+        self.simulation_error = simulation_error
+        self.logs = list(logs or [])
+        self.metadata = dict(metadata or {})
+        self.single_attempt_proven = bool(single_attempt_proven)
+        self.failed_program_id = None
+        for line in self.logs:
+            match = re.match(r"^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) failed:", line)
+            if match:
+                self.failed_program_id = match.group(1)
+                break
+        super().__init__(f"Transaction preflight rejected: {self.signature}: {self.reason}")
+
+
 class QuickNodeClient:
     def __init__(self):
         timeout = float(os.getenv("SOLANA_RPC_TIMEOUT_SECONDS", "20"))
@@ -61,6 +93,35 @@ class QuickNodeClient:
             logger.error(f"Failed to get balance: {e}")
             # An unavailable balance is not an empty wallet.  Returning zero
             # here used to make an RPC outage look like insufficient funds.
+            return None
+
+    async def get_wallet_transaction_delta(self, signature):
+        """Return the signed wallet SOL change from confirmed transaction metadata."""
+        try:
+            sig = Signature.from_string(signature) if isinstance(signature, str) else signature
+            response = await self.client.get_transaction(
+                sig, commitment="confirmed", max_supported_transaction_version=0
+            )
+            result = response.value
+            if result is None:
+                return None
+            transaction = result.transaction
+            meta = transaction.meta
+            if meta is None or meta.err is not None:
+                return None
+            message = transaction.transaction.message
+            keys = list(message.account_keys)
+            owner = Pubkey.from_string(ExecutionConfig.get_wallet_address())
+            index = keys.index(owner)
+            before = int(meta.pre_balances[index])
+            after = int(meta.post_balances[index])
+            return {
+                "wallet_sol_change_lamports": after - before,
+                "network_fee_lamports": int(meta.fee),
+                "source": "confirmed_transaction_meta",
+            }
+        except Exception as error:
+            logger.warning(f"Wallet transaction delta unavailable for {signature}: {error}")
             return None
 
     async def get_token_balance(
@@ -214,8 +275,42 @@ class QuickNodeClient:
             evidence["reason"] = str(error)
             return "unknown", evidence
 
+    async def _send_transaction_once(self, txn, opts):
+        """Submit one HTTP POST; solana-py's provider retries some send POSTs.
+
+        Its transparent ReadError/RemoteProtocolError retry can turn an
+        ambiguous first send into a later preflight rejection. Reuse its
+        serializer, HTTP session and typed response parser, but call the
+        session once so a structured rejection has single-attempt evidence.
+        Test doubles retain the public ``send_transaction`` interface.
+        """
+        provider = getattr(self.client, "_provider", None)
+        if not isinstance(self.client, AsyncClient) or type(provider) is not AsyncHTTPProvider:
+            return await self.client.send_transaction(txn, opts=opts), False
+        request = self.client._send_raw_transaction_body(bytes(txn), opts)
+        kwargs = provider._before_request(request)
+        limiter = provider._limiter
+        if limiter is None:
+            raw_response = await provider.session.post(**kwargs)
+        else:
+            async with limiter:
+                raw_response = await provider.session.post(**kwargs)
+        response = _parse_raw(_after_request_unparsed(raw_response), SendTransactionResp)
+        return self.client._post_send(response), True
+
+    @staticmethod
+    def _preflight_detail(error):
+        """Require the SDK's typed simulation error, never a message match."""
+        if not isinstance(error, RPCException) or len(error.args) != 1:
+            return None
+        detail = error.args[0]
+        if not isinstance(detail, SendTransactionPreflightFailureMessage):
+            return None
+        result = getattr(detail, "data", None)
+        return detail if result is not None and result.err is not None else None
+
     async def send_and_confirm(
-        self, txn, max_retries=3, *, on_submitting=None, last_valid_block_height=None
+        self, txn, max_retries=None, *, on_submitting=None, last_valid_block_height=None
     ):
         # A signed Solana transaction already contains its stable identity.
         # Save it BEFORE network I/O: a lost send response does not mean that
@@ -235,16 +330,25 @@ class QuickNodeClient:
             result = on_submitting(dict(metadata))
             if inspect.isawaitable(result):
                 await result
+        opts = TxOpts(
+            skip_confirmation=True,
+            preflight_commitment="processed",
+            max_retries=max_retries,
+        )
+        single_attempt_proven = isinstance(self.client, AsyncClient) and type(
+            getattr(self.client, "_provider", None)
+        ) is AsyncHTTPProvider
         try:
-            response = await self.client.send_transaction(
-                txn,
-                opts=TxOpts(
-                    skip_confirmation=True,
-                    preflight_commitment="processed",
-                    max_retries=max_retries,
-                ),
-            )
+            response, _ = await self._send_transaction_once(txn, opts)
         except Exception as e:
+            detail = self._preflight_detail(e)
+            if detail is not None:
+                logger.warning(f"Transaction preflight rejected for {sig_str}: {detail.message}")
+                raise TransactionPreflightRejected(
+                    sig_str, detail.message, simulation_error=detail.data.err,
+                    logs=detail.data.logs, metadata=metadata,
+                    single_attempt_proven=single_attempt_proven,
+                ) from e
             logger.warning(f"Transaction submission outcome unknown for {sig_str}: {e}")
             raise TransactionStatusUnknown(sig_str, e, metadata=metadata) from e
 
