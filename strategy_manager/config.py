@@ -19,5 +19,7 @@ class StrategyConfig:
     ENTRY_SCAN_TIMEOUT_SECONDS = 20
     ZERO_BALANCE_ALERT_INTERVAL_SECONDS = 3600
     FAILED_DEX_EXCLUSION_SECONDS = 120
+    # A DEX label lookup must not consume the exit budget needed to quote and send.
+    DEX_LABEL_LOOKUP_TIMEOUT_SECONDS = 1.0
     BUY_THRESHOLD = 0.85
     SELL_THRESHOLD = 0.45

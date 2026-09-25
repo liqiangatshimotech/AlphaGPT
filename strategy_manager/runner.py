@@ -550,7 +550,12 @@ class StrategyRunner:
         drawdown = (pos.highest_price - current_price) / pos.highest_price
 
         if max_gain > StrategyConfig.TRAILING_ACTIVATION and drawdown > StrategyConfig.TRAILING_DROP:
-            logger.warning(f"😠 | TRAILING STOP: {pos.symbol} Max: {max_gain:.2%} DD: {drawdown:.2%}")
+            # A gap can overrun the configured drawdown between monitor passes.
+            # Trailing is still a risk exit even if the current PnL fell below zero.
+            logger.warning(
+                f"😠 | TRAILING STOP: {pos.symbol} Max: {max_gain:.2%} DD: {drawdown:.2%} "
+                f"Full-exit PnL: {exit_pnl_pct:.2%}"
+            )
             await self._execute_sell_bounded(token_addr, 1.0, "TrailingStop")
             return
 
@@ -751,11 +756,7 @@ class StrategyRunner:
             if candidate is not None:
                 program_id, labels, expiry = candidate
                 if time.time() < expiry:
-                    try:
-                        label = await self.trader.jup.get_program_id_label(program_id)
-                    except Exception as error:
-                        logger.warning(f"DEX label unavailable for prior rejected exit: {error}")
-                        label = None
+                    label = await self._failed_dex_label(program_id)
                     if label in labels:
                         excluded_dexes = [label]
                         route_cache[token_addr] = (label, expiry)
@@ -781,13 +782,7 @@ class StrategyRunner:
                 if not await self._release_preflight_rejection(token_addr, exc):
                     return False
                 if attempt == 0 and labels and exc.failed_program_id:
-                    try:
-                        failed_label = await self.trader.jup.get_program_id_label(
-                            exc.failed_program_id
-                        )
-                    except Exception as error:
-                        logger.warning(f"DEX label unavailable for rejected exit: {error}")
-                        failed_label = None
+                    failed_label = await self._failed_dex_label(exc.failed_program_id)
                     if failed_label in labels:
                         excluded_dexes = [failed_label]
                         route_cache[token_addr] = (
@@ -807,6 +802,18 @@ class StrategyRunner:
             await self._reconcile_pending_orders(token_addr)
             return bool(success and token_addr not in self.pending_orders)
         return False
+
+    async def _failed_dex_label(self, program_id):
+        # Unknown within the short budget means "don't exclude"; the route
+        # candidate stays cached so a later exit can still map it.
+        try:
+            return await asyncio.wait_for(
+                self.trader.jup.get_program_id_label(program_id),
+                timeout=StrategyConfig.DEX_LABEL_LOOKUP_TIMEOUT_SECONDS,
+            )
+        except Exception as error:
+            logger.warning(f"DEX label unavailable for rejected exit: {error!r}")
+            return None
 
     async def _run_inference(self, token_addr):
         idx = self.token_map.get(token_addr)

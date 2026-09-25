@@ -221,6 +221,91 @@ class LiveTradingGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.positions[TOKEN].highest_price_basis, "spot")
         self.assertTrue(restored.positions[TOKEN].highest_price_initialized)
 
+    async def test_gapped_trailing_stop_exits_even_below_entry(self):
+        # SKRb: +5.42% peak followed by 7.39% drawdown means current
+        # spot and full-exit quotes are both about 2.37% below entry.
+        self._position()
+        pos = self.runner.portfolio.positions[TOKEN]
+        pos.highest_price_basis = "spot"
+        pos.highest_price_initialized = True
+        pos.highest_price = 1.0542
+        prices = {"full": 0.97631, "spot": 0.97629}
+        self.runner._fetch_live_price_sol = AsyncMock(
+            side_effect=lambda _token, **kwargs: (
+                prices["full"] if "raw_balance" in kwargs else prices["spot"]
+            )
+        )
+        self.runner._execute_sell = AsyncMock(return_value=True)
+
+        await self.runner.monitor_positions()
+        self.runner._execute_sell.assert_awaited_once_with(TOKEN, 1.0, "TrailingStop")
+
+        # New full-exit-basis positions need the same protection after a gap.
+        self.runner._execute_sell.reset_mock()
+        pos.highest_price_basis = "full_exit"
+        pos.highest_price = 1.0542
+        await self.runner.monitor_positions()
+        self.runner._execute_sell.assert_awaited_once_with(TOKEN, 1.0, "TrailingStop")
+
+    async def test_hung_dex_label_lookup_does_not_consume_exit_budget(self):
+        self._position()
+        never = asyncio.Event()
+
+        async def hang(_program_id):
+            await never.wait()
+
+        self.runner.trader.jup.get_program_id_label = AsyncMock(side_effect=hang)
+        self.runner.failed_route_candidates = {
+            TOKEN: ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", ("GoonFi",), time.time() + 60)
+        }
+        self.runner.trader.sell = AsyncMock(return_value=False)
+
+        with patch.object(StrategyConfig, "DEX_LABEL_LOOKUP_TIMEOUT_SECONDS", 0.01):
+            await asyncio.wait_for(
+                self.runner._execute_sell(TOKEN, 1.0, "StopLoss"), timeout=1.0
+            )
+
+        self.assertIsNone(self.runner.trader.sell.await_args.kwargs["exclude_dexes"])
+        # The unmapped candidate is kept so a later exit can still exclude it.
+        self.assertIn(TOKEN, self.runner.failed_route_candidates)
+
+    async def test_first_preflight_label_timeout_defers_retry_until_next_cycle(self):
+        self._position()
+        never = asyncio.Event()
+        error = TransactionPreflightRejected(
+            "rejected-signature", "simulation failed", simulation_error="0x24",
+            single_attempt_proven=True,
+            logs=["Program goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE failed: custom program error: 0x24"],
+        )
+        error.route_labels = ["GoonFi"]
+
+        async def reject(_token, **kwargs):
+            kwargs["on_submitting"]({
+                "signature": "rejected-signature", "pre_raw_balance": RAW_BALANCE,
+                "amount_raw": RAW_BALANCE, "decimals": 6,
+            })
+            raise error
+
+        async def hang(_program_id):
+            await never.wait()
+
+        self.runner.trader.sell = AsyncMock(side_effect=reject)
+        self.runner.trader.jup.get_program_id_label = AsyncMock(side_effect=hang)
+        with patch.object(StrategyConfig, "DEX_LABEL_LOOKUP_TIMEOUT_SECONDS", 0.01):
+            result = await self.runner._execute_sell(TOKEN, 1.0, "StopLoss")
+
+        self.assertFalse(result)
+        self.assertEqual(self.runner.trader.sell.await_count, 1)
+        self.assertNotIn(TOKEN, self.runner.pending_orders)
+        self.assertIn(TOKEN, self.runner.failed_route_candidates)
+
+        self.runner.trader.jup.get_program_id_label = AsyncMock(return_value="GoonFi")
+        self.runner.trader.sell = AsyncMock(return_value=False)
+        await self.runner._execute_sell(TOKEN, 1.0, "StopLoss")
+        self.assertEqual(
+            self.runner.trader.sell.await_args.kwargs["exclude_dexes"], ["GoonFi"]
+        )
+
     async def test_zero_balance_is_quarantined_without_deleting_position(self):
         self._position()
         self.runner.trader.rpc.get_token_balance.side_effect = [0, 0]
